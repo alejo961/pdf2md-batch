@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 PDF2MD Batch Converter
 =====================
@@ -28,6 +28,10 @@ from flask import (
 
 import pymupdf4llm
 import fitz
+
+from conversion_formats import (
+    markdown_to_docx, markdown_to_pdf, to_obsidian_markdown,
+)
 
 try:
     from docx import Document
@@ -201,12 +205,13 @@ def convert_pdf_to_md(pdf_path: Path, output_path: Path, job_id: str, file_index
             force_ocr=use_ocr
         )
 
-        output_path.write_bytes(md_text.encode("utf-8"))
+        outputs = write_markdown_variants(md_text, output_path, pdf_path.name)
         elapsed = round(time.time() - start_time, 2)
 
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "done"
-            jobs[job_id]["files"][file_index]["output"] = str(output_path.name)
+            jobs[job_id]["files"][file_index]["output"] = outputs["standard"]
+            jobs[job_id]["files"][file_index]["output_obsidian"] = outputs["obsidian"]
             jobs[job_id]["files"][file_index]["size_md"] = len(md_text)
             jobs[job_id]["files"][file_index]["time"] = elapsed
             jobs[job_id]["completed"] += 1
@@ -244,12 +249,13 @@ def convert_word_to_md(word_path: Path, output_path: Path, job_id: str, file_ind
         if md_text:
             md_text += "\n"
 
-        output_path.write_text(md_text, encoding="utf-8")
+        outputs = write_markdown_variants(md_text, output_path, word_path.name)
         elapsed = round(time.time() - start_time, 2)
 
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "done"
-            jobs[job_id]["files"][file_index]["output"] = str(output_path.name)
+            jobs[job_id]["files"][file_index]["output"] = outputs["standard"]
+            jobs[job_id]["files"][file_index]["output_obsidian"] = outputs["obsidian"]
             jobs[job_id]["files"][file_index]["size_md"] = len(md_text)
             jobs[job_id]["files"][file_index]["time"] = elapsed
             jobs[job_id]["completed"] += 1
@@ -275,18 +281,34 @@ def convert_file_to_md(input_path: Path, output_path: Path, job_id: str, file_in
             jobs[job_id]["completed"] += 1
 
 
-def combine_md_files(job_output_dir: Path) -> Path:
-    """Combine all MD files in a directory into a single file."""
-    combined_path = job_output_dir / "all_combined.md"
-    md_files = sorted([f for f in job_output_dir.iterdir() if f.suffix == ".md" and f.name != "all_combined.md"])
+def write_markdown_variants(markdown_text: str, standard_path: Path, source_name: str) -> dict:
+    """Write portable Markdown and a fully formed Obsidian note."""
+    standard_path.write_text(markdown_text, encoding="utf-8")
+    obsidian_path = standard_path.with_name(f"{standard_path.stem}.obsidian.md")
+    obsidian_text = to_obsidian_markdown(
+        markdown_text,
+        title=standard_path.stem,
+        source_name=source_name,
+    )
+    obsidian_path.write_text(obsidian_text, encoding="utf-8")
+    return {"standard": standard_path.name, "obsidian": obsidian_path.name}
 
+
+def combine_md_files(job_output_dir: Path, obsidian: bool = False) -> Path:
+    """Combine only the selected Markdown variant into one file."""
+    combined_name = "all_combined.obsidian.md" if obsidian else "all_combined.md"
+    combined_path = job_output_dir / combined_name
+    md_files = sorted([
+        f for f in job_output_dir.iterdir()
+        if f.suffix == ".md"
+        and not f.name.startswith("all_combined")
+        and (f.name.endswith(".obsidian.md") if obsidian else not f.name.endswith(".obsidian.md"))
+    ])
     with open(combined_path, "w", encoding="utf-8") as outf:
         for i, md_file in enumerate(md_files):
             if i > 0:
                 outf.write("\n\n" + "=" * 80 + "\n\n")
-            content = md_file.read_text(encoding="utf-8")
-            outf.write(content)
-
+            outf.write(md_file.read_text(encoding="utf-8"))
     return combined_path
 
 
@@ -345,6 +367,7 @@ def run_batch_conversion(job_id: str):
 
     # Create combined MD file
     combine_md_files(job_output_dir)
+    combine_md_files(job_output_dir, obsidian=True)
 
     # Create ZIP of all outputs
     zip_path = job_output_dir / "all_markdown.zip"
@@ -356,6 +379,69 @@ def run_batch_conversion(job_id: str):
         if images_dir.exists():
             for img in images_dir.iterdir():
                 zf.write(img, f"images/{img.name}")
+
+
+def export_markdown_job(md_files, asset_files, export_pdf: bool, export_word: bool) -> dict:
+    """Convert uploaded Markdown files to polished PDF and/or Word outputs."""
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_export_{id(md_files) % 10000:04d}"
+    upload_dir = UPLOAD_DIR / job_id
+    output_dir = OUTPUT_DIR / job_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for asset in asset_files:
+        if not asset.filename:
+            continue
+        safe_asset = Path(asset.filename.replace("\\", "/")).name
+        if Path(safe_asset).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
+            asset.save(str(upload_dir / safe_asset))
+
+    results = []
+    for md_file in md_files:
+        if not md_file.filename or not md_file.filename.lower().endswith((".md", ".markdown")):
+            continue
+        safe_name = Path(md_file.filename.replace("\\", "/")).name
+        source_path = upload_dir / safe_name
+        md_file.save(str(source_path))
+        item = {"original_name": safe_name, "status": "done", "outputs": [], "error": None}
+        try:
+            content = source_path.read_text(encoding="utf-8-sig")
+            title = source_path.stem.replace(".obsidian", "")
+            if export_pdf:
+                pdf_name = f"{title}.pdf"
+                markdown_to_pdf(content, output_dir / pdf_name, upload_dir, title)
+                item["outputs"].append({"format": "PDF", "filename": pdf_name})
+            if export_word:
+                docx_name = f"{title}.docx"
+                markdown_to_docx(content, output_dir / docx_name, upload_dir, title)
+                item["outputs"].append({"format": "Word", "filename": docx_name})
+        except Exception as exc:
+            item["status"] = "error"
+            item["error"] = str(exc)
+        results.append(item)
+
+    if not results:
+        raise ValueError("No se encontraron archivos Markdown válidos")
+
+    zip_path = output_dir / "exports_pdf_word.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in output_dir.iterdir():
+            if path.suffix.lower() in {".pdf", ".docx"}:
+                archive.write(path, path.name)
+
+    job = {
+        "id": job_id,
+        "status": "done",
+        "type": "markdown_export",
+        "created_at": datetime.now().isoformat(),
+        "finished_at": datetime.now().isoformat(),
+        "total": len(results),
+        "completed": len(results),
+        "files": results,
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+    return job
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -387,6 +473,7 @@ def upload():
                 "size": save_path.stat().st_size,
                 "status": "queued",
                 "output": None,
+                "output_obsidian": None,
                 "error": None,
                 "time": None,
                 "size_md": None,
@@ -473,6 +560,32 @@ def merge_md():
     return jsonify({"job_id": job_id, "total": len(md_files_data), "status": "done"})
 
 
+@app.route("/export-md", methods=["POST"])
+def export_md():
+    """Convert Markdown or Obsidian Markdown to PDF and/or Word."""
+    md_files = request.files.getlist("mds")
+    asset_files = request.files.getlist("assets")
+    if not md_files or all(not item.filename for item in md_files):
+        return jsonify({"error": "Selecciona al menos un archivo Markdown"}), 400
+    export_pdf = request.form.get("exportPdf", "true") == "true"
+    export_word = request.form.get("exportWord", "true") == "true"
+    if not export_pdf and not export_word:
+        return jsonify({"error": "Selecciona PDF, Word o ambos formatos"}), 400
+    try:
+        job = export_markdown_job(md_files, asset_files, export_pdf, export_word)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(job)
+
+
+@app.route("/download-exports/<job_id>")
+def download_exports(job_id):
+    zip_path = OUTPUT_DIR / job_id / "exports_pdf_word.zip"
+    if not zip_path.exists():
+        return jsonify({"error": "El paquete de exportación no existe"}), 404
+    return send_file(str(zip_path.resolve()), as_attachment=True)
+
+
 @app.route("/status/<job_id>")
 def status(job_id):
     """Get job status."""
@@ -487,8 +600,9 @@ def status(job_id):
 def download_file(job_id, filename):
     """Download a single converted file."""
     job_output_dir = OUTPUT_DIR / job_id
-    file_path = job_output_dir / filename
-    if not file_path.exists():
+    safe_filename = Path(filename).name
+    file_path = job_output_dir / safe_filename
+    if not file_path.exists() or not file_path.is_file():
         return jsonify({"error": "File not found"}), 404
     return send_file(str(file_path.resolve()), as_attachment=True)
 
@@ -505,10 +619,14 @@ def download_all(job_id):
 @app.route("/download-combined/<job_id>")
 def download_combined(job_id):
     """Download all converted files as a single combined markdown."""
-    combined_path = OUTPUT_DIR / job_id / "all_combined.md"
+    obsidian = request.args.get("format") == "obsidian"
+    combined_name = "all_combined.obsidian.md" if obsidian else "all_combined.md"
+    combined_path = OUTPUT_DIR / job_id / combined_name
     if not combined_path.exists():
         return jsonify({"error": "Combined file not ready yet"}), 404
-    return send_file(str(combined_path.resolve()), as_attachment=True, download_name="all_combined.md")
+    return send_file(str(combined_path.resolve()), as_attachment=True, download_name=combined_name)
+
+
 
 
 @app.route("/download-merged/<job_id>")
@@ -524,7 +642,7 @@ def download_merged(job_id):
 def preview(job_id, filename):
     """Get markdown content for preview."""
     file_path = OUTPUT_DIR / job_id / filename
-    if not file_path.exists():
+    if not file_path.exists() or not file_path.is_file():
         return jsonify({"error": "File not found"}), 404
     content = file_path.read_text(encoding="utf-8")
     # Truncate for preview
@@ -999,6 +1117,9 @@ body::before {
         <button class="tab-btn active" data-tab="pdf-panel" onclick="switchTab('pdf-panel')">
             📄 Convertir archivos
         </button>
+        <button class="tab-btn" data-tab="export-panel" onclick="switchTab('export-panel')">
+            📤 MD → PDF / Word
+        </button>
         <button class="tab-btn" data-tab="merge-panel" onclick="switchTab('merge-panel')">
             📝 Unir MDs
         </button>
@@ -1109,6 +1230,44 @@ body::before {
 
     </div>
 
+    <!-- Markdown Export Panel -->
+    <div class="tab-content" id="export-panel">
+        <div class="dropzone" id="dropzoneExport" onclick="document.getElementById('fileInputExport').click()">
+            <span class="dropzone-icon">📤</span>
+            <h3>Convierte Markdown a PDF o Word</h3>
+            <p>Admite Markdown normal y Obsidian · agrega imágenes referenciadas si las necesitas</p>
+        </div>
+        <input type="file" id="fileInputExport" accept=".md,.markdown,.png,.jpg,.jpeg,.gif,.webp,.svg" multiple>
+
+        <div class="options-panel active" style="margin-top: 1rem;">
+            <h4>Formatos de salida</h4>
+            <div class="option-row">
+                <label><input type="checkbox" id="exportPdf" checked> PDF maquetado y buscable</label>
+            </div>
+            <div class="option-row">
+                <label><input type="checkbox" id="exportWord" checked> Word editable (.docx)</label>
+            </div>
+        </div>
+
+        <div class="file-queue" id="fileQueueExport"></div>
+        <div class="actions" id="actionsBarExport" style="display: none;">
+            <button class="btn btn-primary" id="exportBtn" onclick="startExport()">✨ Convertir Markdown</button>
+            <button class="btn btn-secondary" onclick="clearAllExport()">✕ Limpiar</button>
+            <span id="fileCountExport" style="color: var(--text-dim); font-size: 0.85rem; font-family: 'JetBrains Mono', monospace;"></span>
+        </div>
+
+        <div class="results-actions" id="exportResults">
+            <div style="width: 100%;">
+                <h3 style="font-size: 1.1rem; margin-bottom: 1rem; color: var(--accent);">Exportación completada</h3>
+                <div class="file-queue" id="exportResultFiles"></div>
+            </div>
+            <button class="btn btn-download" onclick="downloadExports()" style="flex: 1; padding: 1rem;">
+                📦 <strong>Descargar todas las exportaciones</strong><br>
+                <span style="font-size: 0.75rem; opacity: 0.8;">PDF y Word en un ZIP</span>
+            </button>
+        </div>
+    </div>
+
     <!-- Merge MD Panel -->
     <div class="tab-content" id="merge-panel">
 
@@ -1174,6 +1333,7 @@ body::before {
 // ── State ──
 let pendingFiles = [];
 let pendingMdFiles = [];
+let pendingExportFiles = [];
 let currentJobId = null;
 let pollInterval = null;
 
@@ -1184,6 +1344,9 @@ const fileQueue = document.getElementById('fileQueue');
 const dropzoneMd = document.getElementById('dropzoneMd');
 const fileInputMd = document.getElementById('fileInputMd');
 const fileQueueMd = document.getElementById('fileQueueMd');
+const dropzoneExport = document.getElementById('dropzoneExport');
+const fileInputExport = document.getElementById('fileInputExport');
+const fileQueueExport = document.getElementById('fileQueueExport');
 
 // ── Tab Switching ──
 function switchTab(tabName) {
@@ -1226,6 +1389,27 @@ dropzoneMd.addEventListener('drop', ev => {
 fileInputMd.addEventListener('change', () => {
     addMdFiles([...fileInputMd.files]);
     fileInputMd.value = '';
+});
+
+// ── Drag & Drop Markdown Export ──
+['dragenter', 'dragover'].forEach(function(eventName) {
+    dropzoneExport.addEventListener(eventName, function(event) {
+        event.preventDefault();
+        dropzoneExport.classList.add('dragover');
+    });
+});
+['dragleave', 'drop'].forEach(function(eventName) {
+    dropzoneExport.addEventListener(eventName, function(event) {
+        event.preventDefault();
+        dropzoneExport.classList.remove('dragover');
+    });
+});
+dropzoneExport.addEventListener('drop', function(event) {
+    addExportFiles(Array.from(event.dataTransfer.files).filter(isMarkdownExportFile));
+});
+fileInputExport.addEventListener('change', function() {
+    addExportFiles(Array.from(fileInputExport.files));
+    fileInputExport.value = '';
 });
 
 // ── File Management ──
@@ -1273,6 +1457,31 @@ function clearAllMd() {
     renderMdQueue();
     document.getElementById('mergeProgressContainer').classList.remove('active');
     document.getElementById('mergeMergeResults').classList.remove('active');
+}
+
+function isMarkdownExportFile(file) {
+    return /\.(md|markdown|png|jpe?g|gif|webp|svg)$/i.test(file.name);
+}
+
+function addExportFiles(files) {
+    files.filter(isMarkdownExportFile).forEach(function(file) {
+        if (!pendingExportFiles.find(function(current) { return current.name === file.name && current.size === file.size; })) {
+            pendingExportFiles.push(file);
+        }
+    });
+    renderExportQueue();
+}
+
+function removeExportFile(index) {
+    pendingExportFiles.splice(index, 1);
+    renderExportQueue();
+}
+
+function clearAllExport() {
+    pendingExportFiles = [];
+    window.exportJobId = null;
+    renderExportQueue();
+    document.getElementById('exportResults').classList.remove('active');
 }
 
 function formatSize(bytes) {
@@ -1337,6 +1546,25 @@ function renderMdQueue() {
     }
 }
 
+function renderExportQueue() {
+    fileQueueExport.innerHTML = '';
+    pendingExportFiles.forEach(function(file, index) {
+        const div = document.createElement('div');
+        const isMd = /\.(md|markdown)$/i.test(file.name);
+        div.className = 'file-item';
+        div.innerHTML =
+            '<span class="icon">' + (isMd ? '📝' : '🖼️') + '</span>' +
+            '<span class="name" title="' + file.name + '">' + file.name + '</span>' +
+            '<span class="size">' + formatSize(file.size) + '</span>' +
+            '<button class="remove-btn" onclick="removeExportFile(' + index + ')" title="Quitar">×</button>';
+        fileQueueExport.appendChild(div);
+    });
+    const mdCount = pendingExportFiles.filter(function(file) { return /\.(md|markdown)$/i.test(file.name); }).length;
+    document.getElementById('actionsBarExport').style.display = mdCount ? 'flex' : 'none';
+    document.getElementById('fileCountExport').textContent =
+        mdCount + ' Markdown · ' + (pendingExportFiles.length - mdCount) + ' recurso(s)';
+}
+
 // ── Conversion ──
 async function startConversion() {
     if (pendingFiles.length === 0) return;
@@ -1376,6 +1604,54 @@ async function startConversion() {
         alert('Error de conexión: ' + err.message);
         btn.disabled = false;
         btn.innerHTML = '⚡ Convertir todo';
+    }
+}
+
+async function startExport() {
+    const markdownFiles = pendingExportFiles.filter(function(file) { return /\.(md|markdown)$/i.test(file.name); });
+    if (!markdownFiles.length) return;
+    const exportPdf = document.getElementById('exportPdf').checked;
+    const exportWord = document.getElementById('exportWord').checked;
+    if (!exportPdf && !exportWord) {
+        alert('Selecciona PDF, Word o ambos formatos.');
+        return;
+    }
+    const btn = document.getElementById('exportBtn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Formateando...';
+    const formData = new FormData();
+    markdownFiles.forEach(function(file) { formData.append('mds', file); });
+    pendingExportFiles.filter(function(file) { return !/\.(md|markdown)$/i.test(file.name); })
+        .forEach(function(file) { formData.append('assets', file); });
+    formData.append('exportPdf', exportPdf);
+    formData.append('exportWord', exportWord);
+    try {
+        const response = await fetch('/export-md', { method: 'POST', body: formData });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || 'No fue posible exportar');
+        window.exportJobId = data.id;
+        const resultBox = document.getElementById('exportResultFiles');
+        resultBox.innerHTML = '';
+        data.files.forEach(function(file) {
+            const div = document.createElement('div');
+            div.className = 'file-item';
+            const links = (file.outputs || []).map(function(output) {
+                return '<a class="btn btn-secondary" style="padding:0.3rem 0.65rem;text-decoration:none;" href="/download/' +
+                    data.id + '/' + encodeURIComponent(output.filename) + '">↓ ' + output.format + '</a>';
+            }).join('');
+            div.innerHTML = '<span class="icon">📄</span><span class="name">' + file.original_name +
+                '</span><span class="status-badge status-' + file.status + '">' +
+                (file.status === 'done' ? '✓ Listo' : '✗ Error') +
+                '</span><span style="display:flex;gap:0.35rem;">' + links + '</span>';
+            resultBox.appendChild(div);
+        });
+        document.getElementById('exportResults').classList.add('active');
+        btn.textContent = '✓ Completado';
+    } catch (error) {
+        alert('Error: ' + error.message);
+        btn.textContent = '✨ Convertir Markdown';
+    } finally {
+        btn.disabled = false;
     }
 }
 
@@ -1451,13 +1727,18 @@ function updateUI(job) {
 
         let actions = '';
         if (f.status === 'done' && f.output) {
-            actions = `
-                <a href="/download/${job.id}/${f.output}" class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;text-decoration:none;">↓ .md</a>
-                <button class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;" onclick="showPreview('${job.id}','${f.output}')">👁</button>
-            `;
+            actions =
+                '<a href="/download/' + job.id + '/' + encodeURIComponent(f.output) +
+                '" class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;text-decoration:none;">↓ MD</a>' +
+                (f.output_obsidian ?
+                    '<a href="/download/' + job.id + '/' + encodeURIComponent(f.output_obsidian) +
+                    '" class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;text-decoration:none;">↓ Obsidian</a>' : '') +
+                '<button class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;" onclick="showPreview(' +
+                "'" + job.id + "','" + f.output + "'" + ')">👁</button>';
         }
         if (f.status === 'error') {
-            actions = `<span style="color:var(--red);font-size:0.72rem;" title="${f.error || ''}">ver error</span>`;
+            actions = '<span style="color:var(--red);font-size:0.72rem;" title="' +
+                (f.error || '') + '">ver error</span>';
         }
 
         let timeInfo = f.time ? `${f.time}s` : '';
@@ -1491,9 +1772,16 @@ function downloadAll() {
     }
 }
 
-function downloadCombined() {
+function downloadCombined(format) {
     if (currentJobId) {
-        window.location.href = `/download-combined/${currentJobId}`;
+        const suffix = format === 'obsidian' ? '?format=obsidian' : '';
+        window.location.href = '/download-combined/' + currentJobId + suffix;
+    }
+}
+
+function downloadExports() {
+    if (window.exportJobId) {
+        window.location.href = '/download-exports/' + window.exportJobId;
     }
 }
 
@@ -1540,3 +1828,11 @@ if __name__ == "__main__":
 +----------------------------------------------------+
     """)
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+
+
+
+
+
+

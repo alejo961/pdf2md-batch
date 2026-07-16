@@ -1,17 +1,16 @@
-PDF2MD Batch Converter - instrucciones para compartir
+﻿PDF2MD - instrucciones para compartir
 
-1. Copia o descomprime esta carpeta completa en cualquier ubicacion del equipo.
-2. Ejecuta iniciar_app.bat con doble clic.
-3. Espera a que instale lo necesario la primera vez.
-4. Cuando abra el navegador, usa la app en:
-   http://localhost:5000
+1. Descarga el repositorio con Code > Download ZIP.
+2. Descomprime la carpeta completa.
+3. Ejecuta iniciar_app.bat con doble clic.
+4. Espera a que instale Python y las dependencias en la primera ejecución.
+5. Usa la aplicación en http://localhost:5000
 
-Importante:
-- No cierres la ventana negra de CMD mientras estes usando la app.
-- Para detener la app, vuelve a la ventana CMD y presiona Ctrl+C.
-- La primera ejecucion puede tardar porque instala Python y dependencias.
-- Si Windows pregunta permisos de red/firewall, permite el acceso local.
-- Si quieres usar otro puerto, abre CMD en esta carpeta y ejecuta:
-  iniciar_app.bat 8080
+La aplicación permite:
+- PDF y Word a Markdown estándar.
+- PDF y Word a Obsidian Flavored Markdown.
+- Markdown u Obsidian a PDF.
+- Markdown u Obsidian a Word editable.
 
-La app corre localmente en el computador. Los archivos PDF no se suben a internet.
+No cierres la ventana de comandos mientras uses la aplicación. Para detenerla, presiona Ctrl+C.
+Todo el procesamiento se realiza localmente; los documentos no se suben a internet.

@@ -1,71 +1,82 @@
-# PDF → Markdown · Batch Converter
+﻿# PDF2MD · Conversor documental
 
-Aplicación web local para convertir múltiples archivos PDF a Markdown de forma automática.
+Aplicación web local para transformar documentos entre PDF, Word y Markdown, con soporte específico para Obsidian.
 
-## Características
+## Funciones principales
 
-- **Conversión en lote**: arrastra múltiples PDFs y conviértelos todos de una vez
-- **Extracción inteligente**: detecta tablas, encabezados, listas, texto en negrita/itálica, bloques de código
-- **Soporte multi-columna**: maneja correctamente documentos con múltiples columnas
-- **Extracción de imágenes**: las imágenes embebidas se extraen como PNG
-- **Descarga individual o ZIP**: descarga cada `.md` por separado o todo en un `.zip`
-- **Vista previa**: previsualiza el Markdown generado directamente en el navegador
-- **100% local**: nada se sube a internet, todo corre en tu máquina
+- Convierte PDF, DOCX y DOCM a Markdown estándar.
+- Genera simultáneamente una nota Obsidian Flavored Markdown (.obsidian.md).
+- Las notas de Obsidian incluyen propiedades YAML, tags, alias, wikilinks y embeds compatibles.
+- Convierte Markdown estándar u Obsidian a PDF maquetado y buscable.
+- Convierte Markdown estándar u Obsidian a Word editable (.docx).
+- Conserva títulos, negrita, cursiva, listas, tablas, citas, callouts, enlaces y bloques de código.
+- Permite descargar archivos individuales, documentos combinados o paquetes ZIP.
+- Ejecuta todo localmente: los documentos no se envían a servicios externos.
 
-## Requisitos
+## Instalación rápida en Windows
 
-- Python 3.8+
-- ~100 MB de espacio para las dependencias
+1. Descarga el repositorio mediante **Code → Download ZIP**.
+2. Descomprime la carpeta completa.
+3. Ejecuta iniciar_app.bat.
+4. Espera la instalación inicial de Python y las dependencias.
+5. Abre http://localhost:5000 si el navegador no se inicia automáticamente.
 
-## Instalación rápida
+No cierres la ventana de comandos mientras uses la aplicación. Para detenerla, presiona Ctrl+C.
 
-```bash
-# Opción 1: Script automático
+## Ejecución manual
+
+~~~bash
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python app.py
+~~~
+
+En Linux o macOS:
+
+~~~bash
 chmod +x run.sh
 ./run.sh
-
-# Opción 2: Manual
-pip install pymupdf4llm flask
-python app.py
-```
-
-Luego abre **http://localhost:5000** en tu navegador.
+~~~
 
 ## Uso
 
-1. Abre `http://localhost:5000`
-2. Arrastra tus archivos PDF al área de carga (o haz clic para seleccionar)
-3. Presiona **⚡ Convertir todo**
-4. Espera a que termine la conversión
-5. Descarga los archivos `.md` individualmente o todo como `.zip`
+### PDF o Word → Markdown
 
-## Estructura de salida
+1. Abre la pestaña **Convertir archivos**.
+2. Agrega PDF, DOCX o DOCM.
+3. Ajusta OCR e imágenes si lo necesitas.
+4. Convierte y elige entre:
+   - **MD estándar**, compatible con CommonMark/GitHub.
+   - **Obsidian MD**, con frontmatter, wikilinks y embeds.
+   - ZIP con ambas variantes y sus imágenes.
 
-```
-output/
-└── {job_id}/
-    ├── documento1.md
-    ├── documento2.md
-    ├── images/
-    │   ├── documento1.pdf-0-0.png
-    │   └── ...
-    └── all_markdown.zip
-```
+### Markdown → PDF o Word
 
-## Opciones de línea de comando
+1. Abre la pestaña **MD → PDF / Word**.
+2. Agrega uno o varios archivos .md o .markdown.
+3. Si las notas usan imágenes locales, agrégalas en la misma selección.
+4. Elige PDF, Word o ambos.
+5. Descarga cada archivo o el ZIP completo.
 
-```bash
-# Puerto personalizado
+### Unir Markdown
+
+La pestaña **Unir MDs** combina varios archivos en un único documento Markdown.
+
+## Puerto personalizado
+
+~~~bash
+iniciar_app.bat 8080
+~~~
+
+o:
+
+~~~bash
 python app.py 8080
-```
+~~~
 
-## Motor de conversión
+## Tecnologías
 
-Usa [pymupdf4llm](https://github.com/pymupdf/pymupdf4llm), extensión de PyMuPDF optimizada para generar Markdown de alta calidad. Detecta automáticamente:
-
-- Jerarquía de encabezados (por tamaño de fuente → `#`, `##`, `###`)
-- Tablas (formato GitHub-compatible)
-- Texto con estilo (negrita, itálica, monoespaciado)
-- Listas ordenadas y no ordenadas
-- Bloques de código
-- Imágenes y gráficos vectoriales
+- PyMuPDF4LLM y PyMuPDF para PDF y OCR.
+- python-docx para lectura y escritura de Word.
+- Python-Markdown y Beautiful Soup para interpretar y maquetar Markdown.
+- Flask para la interfaz web local.
