@@ -38,3 +38,4 @@ uploads/
 output/
 *.zip
 .env
+.tmp/
