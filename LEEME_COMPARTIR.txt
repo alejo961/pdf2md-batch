@@ -1,4 +1,4 @@
-﻿PDF2MD - instrucciones para compartir
+PDF2MD - instrucciones para compartir
 
 1. Descarga el repositorio con Code > Download ZIP.
 2. Descomprime la carpeta completa.
@@ -8,9 +8,6 @@
 
 La aplicación permite:
 - PDF y Word a Markdown estándar.
-- PDF y Word a Obsidian Flavored Markdown.
-- Markdown u Obsidian a PDF.
-- Markdown u Obsidian a Word editable.
 
 No cierres la ventana de comandos mientras uses la aplicación. Para detenerla, presiona Ctrl+C.
 Todo el procesamiento se realiza localmente; los documentos no se suben a internet.

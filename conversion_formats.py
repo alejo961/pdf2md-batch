@@ -1,10 +1,8 @@
-﻿"""Helpers for standard Markdown, Obsidian notes, PDF and Word exports."""
+"""Helpers for standard Markdown, PDF and Word exports."""
 
 from __future__ import annotations
 
-import json
 import re
-from datetime import date
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -38,87 +36,14 @@ hr { border: 0; border-top: 1px solid #ccd5e3; margin: 1.2em 0; }
 """
 
 
-def _yaml_text(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def to_obsidian_markdown(markdown_text: str, title: str, source_name: str) -> str:
-    """Add valid Obsidian YAML properties and translate local links / embeds."""
-    content = markdown_text.strip()
-
-    def replace_image(match):
-        alt = match.group(1).strip()
-        target = match.group(2).strip().split(' "', 1)[0].strip("<>")
-        if re.match(r"^(?:https?:|data:)", target, re.I):
-            return match.group(0)
-        target = unquote(target).replace("\\", "/")
-        return f"![[{target}{'|' + alt if alt else ''}]]"
-
-    content = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image, content)
-
-    def replace_link(match):
-        label = match.group(1).strip()
-        target = match.group(2).strip().strip("<>")
-        if re.match(r"^(?:https?:|mailto:|#)", target, re.I) or ".md" not in target.lower():
-            return match.group(0)
-        target = re.sub(r"\.md(?=#|$)", "", unquote(target).replace("\\", "/"), flags=re.I)
-        return f"[[{target}|{label}]]" if label != target else f"[[{target}]]"
-
-    content = re.sub(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)", replace_link, content)
-    frontmatter = "\n".join([
-        "---",
-        f"title: {_yaml_text(title)}",
-        f"source: {_yaml_text(source_name)}",
-        f"created: {date.today().isoformat()}",
-        "tags:",
-        "  - converted",
-        "  - obsidian",
-        "aliases:",
-        f"  - {_yaml_text(title)}",
-        "---",
-    ])
-    return f"{frontmatter}\n\n{content}\n"
-
-
-def normalize_obsidian_markdown(markdown_text: str) -> str:
-    """Convert Obsidian-only syntax to portable Markdown for PDF / Word."""
-    text = markdown_text.replace("\r\n", "\n")
-    text = re.sub(r"\A---\n.*?\n---\n?", "", text, count=1, flags=re.S)
-    text = re.sub(r"%%.*?%%", "", text, flags=re.S)
-    text = re.sub(r"==(.+?)==", r"**\1**", text)
-
-    def replace_embed(match):
-        target = match.group(1).strip()
-        parts = target.split("|", 1)
-        path = parts[0].split("#", 1)[0]
-        label = parts[1] if len(parts) > 1 else Path(path).name
-        if Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
-            return f"![{label}]({path})"
-        return f"**Adjunto:** {label}"
-
-    text = re.sub(r"!\[\[([^\]]+)\]\]", replace_embed, text)
-
-    def replace_wikilink(match):
-        parts = match.group(1).strip().split("|", 1)
-        return parts[1] if len(parts) > 1 else parts[0].split("#", 1)[0]
-
-    text = re.sub(r"(?<!!)\[\[([^\]]+)\]\]", replace_wikilink, text)
-    text = re.sub(
-        r"^>\s*\[!([a-zA-Z-]+)\][+-]?\s*(.*)$",
-        lambda m: f"> **{(m.group(2) or m.group(1)).strip().title()}**",
-        text,
-        flags=re.M,
-    )
-    return text.strip() + "\n"
-
-
 def markdown_to_html(markdown_text: str) -> str:
+    """Render portable standard Markdown as HTML."""
+    standard_text = markdown_text.replace("\r\n", "\n").strip() + "\n"
     return markdown.markdown(
-        normalize_obsidian_markdown(markdown_text),
+        standard_text,
         extensions=MARKDOWN_EXTENSIONS,
         output_format="html5",
     )
-
 
 def _safe_image_path(src: str, base_dir: Path) -> Path | None:
     parsed = urlparse(src)
@@ -152,7 +77,7 @@ def _prepare_html_assets(html_text: str, base_dir: Path) -> str:
 
 
 def markdown_to_pdf(markdown_text: str, output_path: Path, base_dir: Path, title: str) -> Path:
-    """Render Markdown / Obsidian Markdown to a paginated searchable PDF."""
+    """Render standard Markdown to a paginated searchable PDF."""
     html_body = _prepare_html_assets(markdown_to_html(markdown_text), base_dir)
     html_doc = "<html><head><meta charset='utf-8'></head><body><article>" + html_body + "</article></body></html>"
     story = fitz.Story(html=html_doc, user_css=PDF_CSS, archive=fitz.Archive(str(base_dir)))
@@ -268,7 +193,7 @@ def _render_table(document: Document, table_tag: Tag):
 
 
 def markdown_to_docx(markdown_text: str, output_path: Path, base_dir: Path, title: str) -> Path:
-    """Render Markdown / Obsidian Markdown to a styled editable Word file."""
+    """Render standard Markdown to a styled editable Word file."""
     soup = BeautifulSoup(markdown_to_html(markdown_text), "html.parser")
     document = Document()
     _configure_document(document, title)

@@ -20,6 +20,7 @@ import shutil
 import threading
 from pathlib import Path
 from datetime import datetime
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import (
@@ -31,7 +32,7 @@ import pymupdf4llm
 import fitz
 
 from conversion_formats import (
-    markdown_to_docx, markdown_to_pdf, to_obsidian_markdown,
+    markdown_to_docx, markdown_to_pdf,
 )
 
 try:
@@ -85,6 +86,114 @@ jobs_lock = threading.Lock()
 ocr_lock = threading.Lock()
 OCR_MAX_ATTEMPTS = 3
 OCR_RETRY_DELAY_SECONDS = 0.5
+
+
+def persist_job_snapshot_locked(job_id: str) -> None:
+    """Atomically persist a job while jobs_lock is held."""
+    job = jobs.get(job_id)
+    if job is None:
+        return
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = job_dir / "job.json"
+    temporary_path = job_dir / "job.json.tmp"
+    temporary_path.write_text(
+        json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary_path, snapshot_path)
+
+
+def load_job_snapshots() -> list[str]:
+    """Load persisted jobs and return interrupted job IDs that can resume."""
+    resumable = []
+    for snapshot_path in OUTPUT_DIR.glob("*/job.json"):
+        try:
+            job = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            job_id = str(job.get("id") or snapshot_path.parent.name)
+            if not JOB_ID_PATTERN.fullmatch(job_id):
+                continue
+            if job.get("status") == "running":
+                for item in job.get("files", []):
+                    if item.get("status") in {"queued", "converting"}:
+                        item["status"] = "queued"
+                job["completed"] = sum(
+                    item.get("status") in {"done", "error"}
+                    for item in job.get("files", [])
+                )
+                if (UPLOAD_DIR / job_id).is_dir():
+                    resumable.append(job_id)
+            jobs[job_id] = job
+        except (OSError, ValueError, TypeError):
+            continue
+    return resumable
+CONVERSION_MAX_WORKERS = min(os.cpu_count() or 4, 4)
+conversion_executor = ThreadPoolExecutor(max_workers=CONVERSION_MAX_WORKERS)
+JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+OMITTED_IMAGE_PATTERN = re.compile(
+    r"(?mi)^\s*(?:\*{0,2})?==>\s*picture\s*\[[^\]]*\]\s*"
+    r"intentionally omitted\s*<==(?:\*{0,2})?\s*$"
+)
+
+
+def sanitize_upload_name(filename: str) -> str:
+    """Return a portable filename that cannot escape its job directory."""
+    name = Path(filename.replace("\\", "/")).name
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return name or "document"
+
+def unique_upload_name(filename: str, used_names: set[str]) -> str:
+    """Avoid concurrent writes when uploaded filenames collide."""
+    candidate = sanitize_upload_name(filename)
+    stem, suffix = Path(candidate).stem, Path(candidate).suffix
+    counter = 2
+    while candidate.casefold() in used_names:
+        candidate = f"{stem}_{counter}{suffix}"
+        counter += 1
+    used_names.add(candidate.casefold())
+    return candidate
+
+
+def resolve_job_directory(root: Path, job_id: str) -> Path | None:
+    """Resolve a job directory only when it remains below the configured root."""
+    if not JOB_ID_PATTERN.fullmatch(job_id or ""):
+        return None
+    base = root.resolve()
+    candidate = (base / job_id).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return None
+    return candidate
+
+
+def resolve_job_file(root: Path, job_id: str, filename: str) -> Path | None:
+    """Resolve one direct child file of a validated job directory."""
+    job_dir = resolve_job_directory(root, job_id)
+    if job_dir is None or sanitize_upload_name(filename) != filename:
+        return None
+    candidate = (job_dir / filename).resolve()
+    try:
+        candidate.relative_to(job_dir)
+    except ValueError:
+        return None
+    return candidate
+
+
+def clean_page_markdown(markdown_text: str) -> str:
+    """Remove extractor placeholders and empty Markdown headings."""
+    text = OMITTED_IMAGE_PATTERN.sub("", markdown_text or "")
+    text = re.sub(r"(?m)^#{1,6}\s*$", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def markdown_semantic_word_count(markdown_text: str) -> int:
+    """Count meaningful words after removing Markdown-only structure."""
+    text = clean_page_markdown(markdown_text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)|!\[\[[^\]]+\]\]", "", text)
+    text = re.sub(r"(?m)^## Página \d+\s*$|^[-_=]{3,}\s*$", "", text)
+    text = re.sub(r"[#*_`>|]", " ", text)
+    return len(re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{3,}", text))
 
 
 # ─── Utility Logic ───────────────────────────────────────────────────────────
@@ -149,23 +258,12 @@ def docx_paragraph_to_markdown(paragraph) -> str:
 
 
 def is_image_only_markdown(markdown_text: str) -> bool:
-    """Detect output that points to extracted page images instead of text."""
-    stripped = markdown_text.strip()
+    """Detect output that contains image references but no useful text."""
+    stripped = (markdown_text or "").strip()
     if not stripped:
         return True
-
-    markdown_images = re.findall(r"!\[[^\]]*\]\([^)]*\)", stripped)
-    obsidian_images = re.findall(r"!\[\[[^\]]+\]\]", stripped)
-    image_refs = markdown_images + obsidian_images
-    if not image_refs:
-        return False
-
-    without_images = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", stripped)
-    without_images = re.sub(r"!\[\[[^\]]+\]\]", "", without_images)
-    without_rules = re.sub(r"[-_=]{3,}", "", without_images)
-    words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{3,}", without_rules)
-    return len(words) < 10
-
+    has_images = bool(re.search(r"!\[[^\]]*\]\([^)]*\)|!\[\[[^\]]+\]\]", stripped))
+    return has_images and markdown_semantic_word_count(stripped) < 10
 
 def ocr_page_to_markdown(page, page_number: int, dpi: int) -> str:
     """Run thread-safe OCR on one page, retrying temporary Leptonica failures."""
@@ -203,21 +301,25 @@ def ocr_page_to_markdown(page, page_number: int, dpi: int) -> str:
 def pdf_to_markdown_page_by_page(pdf_path: Path, output_path: Path, options: dict) -> str:
     """Convert every page independently, applying OCR only where required."""
     ocr_mode = options.get("ocr_mode", "auto")
-    dpi = int(options.get("ocr_dpi") or 300)
+    dpi = max(72, min(int(options.get("ocr_dpi") or 300), 600))
     write_images = bool(options.get("extract_images", False))
     page_blocks = []
 
     with fitz.open(str(pdf_path)) as doc:
         for page_index, page in enumerate(doc):
             page_number = page_index + 1
+            native_text = (page.get_text("text") or "").strip()
+            page_has_images = bool(page.get_images(full=True))
             should_ocr = ocr_mode == "force" or (
-                ocr_mode == "auto" and not page_has_usable_text(page) and bool(page.get_images(full=True))
+                ocr_mode == "auto"
+                and not page_has_usable_text(page)
+                and page_has_images
             )
 
             page_markdown = ""
             if not should_ocr:
                 page_markdown = pymupdf4llm.to_markdown(
-                    str(pdf_path),
+                    doc,
                     pages=[page_index],
                     write_images=write_images,
                     image_path=str(output_path.parent / "images"),
@@ -226,10 +328,9 @@ def pdf_to_markdown_page_by_page(pdf_path: Path, output_path: Path, options: dic
                     use_ocr=False,
                     header=not options.get("exclude_headers", False),
                     footer=not options.get("exclude_headers", False),
-                ).strip()
+                )
+                page_markdown = clean_page_markdown(page_markdown)
 
-                # A scanned page can contain a tiny digital stamp or page number.
-                # If extraction still yields only PNG links, retry that page with OCR.
                 if is_image_only_markdown(page_markdown):
                     if ocr_mode == "none":
                         raise RuntimeError(
@@ -237,26 +338,43 @@ def pdf_to_markdown_page_by_page(pdf_path: Path, output_path: Path, options: dic
                             "Activa OCR automático o forzado para extraer su texto."
                         )
                     should_ocr = True
+                elif (
+                    markdown_semantic_word_count(page_markdown) < 10
+                    and markdown_semantic_word_count(native_text) >= 10
+                ):
+                    # Some PDFs expose valid native text while the layout engine
+                    # returns only empty headings. Preserve that native text.
+                    page_markdown = native_text
+                elif (
+                    markdown_semantic_word_count(page_markdown) == 0
+                    and page_has_images
+                    and ocr_mode != "none"
+                ):
+                    should_ocr = True
 
             if should_ocr:
-                page_markdown = ocr_page_to_markdown(page, page_number, dpi)
+                page_markdown = clean_page_markdown(
+                    ocr_page_to_markdown(page, page_number, dpi)
+                )
                 if not page_markdown:
-                    # Truly blank pages are valid; image pages with no OCR text are not.
-                    if page.get_images(full=True):
+                    if page_has_images:
                         raise RuntimeError(
                             f"OCR no devolvió texto en la página {page_number}. "
-                            "Verifica la calidad del escaneo y la instalación de Tesseract."
+                            "Verifica la calidad del escaneo."
                         )
                     page_markdown = "_Página sin texto reconocible._"
 
+            if not page_markdown:
+                page_markdown = "_Página sin texto reconocible._"
             page_blocks.append(f"## Página {page_number}\n\n{page_markdown}".strip())
 
     markdown_text = "\n\n---\n\n".join(page_blocks).strip()
-    if not markdown_text or is_image_only_markdown(markdown_text):
+    if markdown_semantic_word_count(markdown_text) == 0:
         raise RuntimeError(
-            "La conversión no produjo texto; se evitó crear un Markdown con una lista de imágenes."
+            "La conversión no produjo texto útil; no se creó un Markdown vacío."
         )
     return markdown_text + "\n"
+
 def docx_table_to_markdown(table) -> str:
     """Convert a Word table to GitHub-flavored Markdown."""
     rows = []
@@ -297,22 +415,23 @@ def convert_pdf_to_md(pdf_path: Path, output_path: Path, job_id: str, file_index
 
     try:
         md_text = pdf_to_markdown_page_by_page(pdf_path, output_path, options)
-        outputs = write_markdown_variants(md_text, output_path, pdf_path.name)
+        output_name = write_markdown_output(md_text, output_path)
         elapsed = round(time.time() - start_time, 2)
 
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "done"
-            jobs[job_id]["files"][file_index]["output"] = outputs["standard"]
-            jobs[job_id]["files"][file_index]["output_obsidian"] = outputs["obsidian"]
+            jobs[job_id]["files"][file_index]["output"] = output_name
             jobs[job_id]["files"][file_index]["size_md"] = len(md_text)
             jobs[job_id]["files"][file_index]["time"] = elapsed
             jobs[job_id]["completed"] += 1
+            persist_job_snapshot_locked(job_id)
 
     except Exception as e:
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "error"
             jobs[job_id]["files"][file_index]["error"] = str(e)
             jobs[job_id]["completed"] += 1
+            persist_job_snapshot_locked(job_id)
 
 
 def convert_word_to_md(word_path: Path, output_path: Path, job_id: str, file_index: int):
@@ -341,22 +460,23 @@ def convert_word_to_md(word_path: Path, output_path: Path, job_id: str, file_ind
         if md_text:
             md_text += "\n"
 
-        outputs = write_markdown_variants(md_text, output_path, word_path.name)
+        output_name = write_markdown_output(md_text, output_path)
         elapsed = round(time.time() - start_time, 2)
 
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "done"
-            jobs[job_id]["files"][file_index]["output"] = outputs["standard"]
-            jobs[job_id]["files"][file_index]["output_obsidian"] = outputs["obsidian"]
+            jobs[job_id]["files"][file_index]["output"] = output_name
             jobs[job_id]["files"][file_index]["size_md"] = len(md_text)
             jobs[job_id]["files"][file_index]["time"] = elapsed
             jobs[job_id]["completed"] += 1
+            persist_job_snapshot_locked(job_id)
 
     except Exception as e:
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "error"
             jobs[job_id]["files"][file_index]["error"] = str(e)
             jobs[job_id]["completed"] += 1
+            persist_job_snapshot_locked(job_id)
 
 
 def convert_file_to_md(input_path: Path, output_path: Path, job_id: str, file_index: int, options: dict = None):
@@ -371,38 +491,29 @@ def convert_file_to_md(input_path: Path, output_path: Path, job_id: str, file_in
             jobs[job_id]["files"][file_index]["status"] = "error"
             jobs[job_id]["files"][file_index]["error"] = f"Unsupported file type: {suffix}"
             jobs[job_id]["completed"] += 1
+            persist_job_snapshot_locked(job_id)
 
 
-def write_markdown_variants(markdown_text: str, standard_path: Path, source_name: str) -> dict:
-    """Write portable Markdown and a fully formed Obsidian note."""
-    standard_path.write_text(markdown_text, encoding="utf-8")
-    obsidian_path = standard_path.with_name(f"{standard_path.stem}.obsidian.md")
-    obsidian_text = to_obsidian_markdown(
-        markdown_text,
-        title=standard_path.stem,
-        source_name=source_name,
-    )
-    obsidian_path.write_text(obsidian_text, encoding="utf-8")
-    return {"standard": standard_path.name, "obsidian": obsidian_path.name}
+def write_markdown_output(markdown_text: str, output_path: Path) -> str:
+    """Write one portable standard Markdown output."""
+    output_path.write_text(markdown_text, encoding="utf-8")
+    return output_path.name
 
 
-def combine_md_files(job_output_dir: Path, obsidian: bool = False) -> Path:
-    """Combine only the selected Markdown variant into one file."""
-    combined_name = "all_combined.obsidian.md" if obsidian else "all_combined.md"
-    combined_path = job_output_dir / combined_name
-    md_files = sorted([
-        f for f in job_output_dir.iterdir()
-        if f.suffix == ".md"
-        and not f.name.startswith("all_combined")
-        and (f.name.endswith(".obsidian.md") if obsidian else not f.name.endswith(".obsidian.md"))
-    ])
-    with open(combined_path, "w", encoding="utf-8") as outf:
-        for i, md_file in enumerate(md_files):
-            if i > 0:
-                outf.write("\n\n" + "=" * 80 + "\n\n")
-            outf.write(md_file.read_text(encoding="utf-8"))
+def combine_md_files(job_output_dir: Path, output_names: list[str]) -> Path:
+    """Combine the successful standard Markdown outputs into one file."""
+    combined_path = job_output_dir / "all_combined.md"
+    markdown_files = [
+        job_output_dir / name
+        for name in output_names
+        if name and (job_output_dir / name).is_file()
+    ]
+    with combined_path.open("w", encoding="utf-8") as output_file:
+        for index, markdown_file in enumerate(markdown_files):
+            if index:
+                output_file.write("\n\n" + "=" * 80 + "\n\n")
+            output_file.write(markdown_file.read_text(encoding="utf-8"))
     return combined_path
-
 
 def merge_md_files(md_files_data: list, job_id: str) -> Path:
     """Merge uploaded MD files into a single file."""
@@ -421,61 +532,84 @@ def merge_md_files(md_files_data: list, job_id: str) -> Path:
     return merged_path
 
 
+def convert_queued_file_to_md(
+    input_path: Path,
+    output_path: Path,
+    job_id: str,
+    file_index: int,
+    options: dict,
+):
+    """Mark a queued file active only when a global worker actually starts it."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None:
+            return
+        job["files"][file_index]["status"] = "converting"
+        persist_job_snapshot_locked(job_id)
+    convert_file_to_md(input_path, output_path, job_id, file_index, options)
+
+
 def run_batch_conversion(job_id: str):
-    """Process all supported files in a job in parallel."""
+    """Process a job through the shared bounded conversion queue."""
     job = jobs[job_id]
     job_upload_dir = UPLOAD_DIR / job_id
     job_output_dir = OUTPUT_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
     (job_output_dir / "images").mkdir(exist_ok=True)
-
     options = job.get("options", {})
 
-    # Use ThreadPoolExecutor for parallel conversion
-    max_workers = min(os.cpu_count() or 4, 8)
+    futures = []
+    for i, file_info in enumerate(job["files"]):
+        if file_info.get("status") in {"done", "error"}:
+            continue
+        input_path = job_upload_dir / file_info["original_name"]
+        output_path = job_output_dir / (Path(file_info["original_name"]).stem + ".md")
+        futures.append(
+            conversion_executor.submit(
+                convert_queued_file_to_md,
+                input_path,
+                output_path,
+                job_id,
+                i,
+                options,
+            )
+        )
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for i, file_info in enumerate(job["files"]):
-            input_path = job_upload_dir / file_info["original_name"]
-            md_name = Path(file_info["original_name"]).stem + ".md"
-            output_path = job_output_dir / md_name
+    for future in futures:
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"Error in future result: {exc}")
 
-            with jobs_lock:
-                file_info["status"] = "converting"
+    with jobs_lock:
+        job["status"] = "packaging"
+        persist_job_snapshot_locked(job_id)
 
-            futures.append(executor.submit(convert_file_to_md, input_path, output_path, job_id, i, options))
+    output_names = [
+        item.get("output") for item in job["files"]
+        if item.get("status") == "done" and item.get("output")
+    ]
+    combine_md_files(job_output_dir, output_names)
 
-        # Wait for all conversions to finish
-        for future in futures:
-            try:
-                future.result()
-            except Exception as e:
-                print(f"Error in future result: {e}")
+    zip_path = job_output_dir / "all_markdown.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in [*output_names, "all_combined.md"]:
+            path = job_output_dir / name
+            if path.is_file():
+                zf.write(path, path.name)
+        images_dir = job_output_dir / "images"
+        if images_dir.exists():
+            for image_path in images_dir.iterdir():
+                zf.write(image_path, f"images/{image_path.name}")
 
     with jobs_lock:
         job["status"] = "done"
         job["finished_at"] = datetime.now().isoformat()
-
-    # Create combined MD file
-    combine_md_files(job_output_dir)
-    combine_md_files(job_output_dir, obsidian=True)
-
-    # Create ZIP of all outputs
-    zip_path = job_output_dir / "all_markdown.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in job_output_dir.iterdir():
-            if f.suffix == ".md":
-                zf.write(f, f.name)
-        images_dir = job_output_dir / "images"
-        if images_dir.exists():
-            for img in images_dir.iterdir():
-                zf.write(img, f"images/{img.name}")
-
+        persist_job_snapshot_locked(job_id)
 
 def export_markdown_job(md_files, asset_files, export_pdf: bool, export_word: bool) -> dict:
     """Convert uploaded Markdown files to polished PDF and/or Word outputs."""
-    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_export_{id(md_files) % 10000:04d}"
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S_export_") + uuid4().hex[:8]
     upload_dir = UPLOAD_DIR / job_id
     output_dir = OUTPUT_DIR / job_id
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -484,7 +618,7 @@ def export_markdown_job(md_files, asset_files, export_pdf: bool, export_word: bo
     for asset in asset_files:
         if not asset.filename:
             continue
-        safe_asset = Path(asset.filename.replace("\\", "/")).name
+        safe_asset = sanitize_upload_name(asset.filename)
         if Path(safe_asset).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
             asset.save(str(upload_dir / safe_asset))
 
@@ -492,13 +626,13 @@ def export_markdown_job(md_files, asset_files, export_pdf: bool, export_word: bo
     for md_file in md_files:
         if not md_file.filename or not md_file.filename.lower().endswith((".md", ".markdown")):
             continue
-        safe_name = Path(md_file.filename.replace("\\", "/")).name
+        safe_name = sanitize_upload_name(md_file.filename)
         source_path = upload_dir / safe_name
         md_file.save(str(source_path))
         item = {"original_name": safe_name, "status": "done", "outputs": [], "error": None}
         try:
             content = source_path.read_text(encoding="utf-8-sig")
-            title = source_path.stem.replace(".obsidian", "")
+            title = source_path.stem
             if export_pdf:
                 pdf_name = f"{title}.pdf"
                 markdown_to_pdf(content, output_dir / pdf_name, upload_dir, title)
@@ -533,6 +667,7 @@ def export_markdown_job(md_files, asset_files, export_pdf: bool, export_word: bo
     }
     with jobs_lock:
         jobs[job_id] = job
+        persist_job_snapshot_locked(job_id)
     return job
 
 
@@ -550,14 +685,15 @@ def upload():
     if not files or all(f.filename == "" for f in files):
         return jsonify({"error": "No files uploaded"}), 400
 
-    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{id(files) % 10000:04d}"
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8]
     job_upload_dir = UPLOAD_DIR / job_id
     job_upload_dir.mkdir(parents=True, exist_ok=True)
 
     file_list = []
+    used_names = set()
     for f in files:
         if f.filename and is_supported_convert_file(f.filename):
-            safe_name = f.filename.replace("/", "_").replace("\\", "_")
+            safe_name = unique_upload_name(f.filename, used_names)
             save_path = job_upload_dir / safe_name
             f.save(str(save_path))
             file_list.append({
@@ -565,7 +701,6 @@ def upload():
                 "size": save_path.stat().st_size,
                 "status": "queued",
                 "output": None,
-                "output_obsidian": None,
                 "error": None,
                 "time": None,
                 "size_md": None,
@@ -583,12 +718,15 @@ def upload():
     except Exception:
         ocr_dpi = None
 
+    ocr_dpi = max(72, min(ocr_dpi or 300, 600))
+    ocr_mode = request.form.get("ocrMode", "auto")
+    if ocr_mode not in {"auto", "force", "none"}:
+        ocr_mode = "auto"
     options = {
         "extract_images": request.form.get("optImages") == "true",
         "exclude_headers": request.form.get("optHeaders") == "true",
-        "ocr_mode": request.form.get("ocrMode", "auto"),
+        "ocr_mode": ocr_mode,
         "ocr_dpi": ocr_dpi,
-        "ocr_preprocess": request.form.get("ocrPreprocess") == "true"
     }
 
     with jobs_lock:
@@ -602,6 +740,7 @@ def upload():
             "files": file_list,
             "options": options
         }
+        persist_job_snapshot_locked(job_id)
 
     # Run conversion in background thread
     thread = threading.Thread(target=run_batch_conversion, args=(job_id,), daemon=True)
@@ -617,7 +756,7 @@ def merge_md():
     if not files or all(f.filename == "" for f in files):
         return jsonify({"error": "No files uploaded"}), 400
 
-    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_merge_{id(files) % 10000:04d}"
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S_merge_") + uuid4().hex[:8]
 
     md_files_data = []
     for f in files:
@@ -648,13 +787,14 @@ def merge_md():
             "completed": len(md_files_data),
             "files": [{"original_name": f["name"], "status": "done"} for f in md_files_data],
         }
+        persist_job_snapshot_locked(job_id)
 
     return jsonify({"job_id": job_id, "total": len(md_files_data), "status": "done"})
 
 
 @app.route("/export-md", methods=["POST"])
 def export_md():
-    """Convert Markdown or Obsidian Markdown to PDF and/or Word."""
+    """Convert standard Markdown to PDF and/or Word."""
     md_files = request.files.getlist("mds")
     asset_files = request.files.getlist("assets")
     if not md_files or all(not item.filename for item in md_files):
@@ -672,15 +812,17 @@ def export_md():
 
 @app.route("/download-exports/<job_id>")
 def download_exports(job_id):
-    zip_path = OUTPUT_DIR / job_id / "exports_pdf_word.zip"
-    if not zip_path.exists():
+    zip_path = resolve_job_file(OUTPUT_DIR, job_id, "exports_pdf_word.zip")
+    if zip_path is None or not zip_path.is_file():
         return jsonify({"error": "El paquete de exportación no existe"}), 404
-    return send_file(str(zip_path.resolve()), as_attachment=True)
+    return send_file(str(zip_path), as_attachment=True)
 
 
 @app.route("/status/<job_id>")
 def status(job_id):
     """Get job status."""
+    if resolve_job_directory(OUTPUT_DIR, job_id) is None:
+        return jsonify({"error": "Job not found"}), 404
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
@@ -688,60 +830,88 @@ def status(job_id):
     return jsonify(job)
 
 
+@app.route("/retry-errors/<job_id>", methods=["POST"])
+def retry_errors(job_id):
+    """Retry only failed files from a completed persisted job."""
+    if resolve_job_directory(OUTPUT_DIR, job_id) is None:
+        return jsonify({"error": "Job not found"}), 404
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job.get("status") == "running":
+            return jsonify({"error": "El trabajo todavía está en ejecución"}), 409
+        retry_count = 0
+        for item in job.get("files", []):
+            if item.get("status") == "error":
+                item.update({
+                    "status": "queued",
+                    "error": None,
+                    "time": None,
+                    "size_md": None,
+                    "output": None,
+                })
+                retry_count += 1
+        if not retry_count:
+            return jsonify({"error": "No hay archivos con error para reintentar"}), 400
+        job["status"] = "running"
+        job["finished_at"] = None
+        job["completed"] = sum(
+            item.get("status") == "done" for item in job.get("files", [])
+        )
+        persist_job_snapshot_locked(job_id)
+    threading.Thread(target=run_batch_conversion, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id, "retried": retry_count, "status": "running"})
+
+
 @app.route("/download/<job_id>/<filename>")
 def download_file(job_id, filename):
-    """Download a single converted file."""
-    job_output_dir = OUTPUT_DIR / job_id
-    safe_filename = Path(filename).name
-    file_path = job_output_dir / safe_filename
-    if not file_path.exists() or not file_path.is_file():
+    """Download a validated direct child of a job output directory."""
+    file_path = resolve_job_file(OUTPUT_DIR, job_id, filename)
+    if file_path is None or not file_path.is_file():
         return jsonify({"error": "File not found"}), 404
-    return send_file(str(file_path.resolve()), as_attachment=True)
+    return send_file(str(file_path), as_attachment=True)
 
 
 @app.route("/download-all/<job_id>")
 def download_all(job_id):
     """Download all converted files as ZIP."""
-    zip_path = OUTPUT_DIR / job_id / "all_markdown.zip"
-    if not zip_path.exists():
+    zip_path = resolve_job_file(OUTPUT_DIR, job_id, "all_markdown.zip")
+    if zip_path is None or not zip_path.is_file():
         return jsonify({"error": "ZIP not ready yet"}), 404
-    return send_file(str(zip_path.resolve()), as_attachment=True)
+    return send_file(str(zip_path), as_attachment=True)
 
 
 @app.route("/download-combined/<job_id>")
 def download_combined(job_id):
     """Download all converted files as a single combined markdown."""
-    obsidian = request.args.get("format") == "obsidian"
-    combined_name = "all_combined.obsidian.md" if obsidian else "all_combined.md"
-    combined_path = OUTPUT_DIR / job_id / combined_name
-    if not combined_path.exists():
+    combined_name = "all_combined.md"
+
+    combined_path = resolve_job_file(OUTPUT_DIR, job_id, combined_name)
+    if combined_path is None or not combined_path.is_file():
         return jsonify({"error": "Combined file not ready yet"}), 404
-    return send_file(str(combined_path.resolve()), as_attachment=True, download_name=combined_name)
-
-
+    return send_file(str(combined_path), as_attachment=True, download_name=combined_name)
 
 
 @app.route("/download-merged/<job_id>")
 def download_merged(job_id):
     """Download merged markdown file."""
-    merged_path = OUTPUT_DIR / job_id / "merged_markdown.md"
-    if not merged_path.exists():
+    merged_path = resolve_job_file(OUTPUT_DIR, job_id, "merged_markdown.md")
+    if merged_path is None or not merged_path.is_file():
         return jsonify({"error": "Merged file not found"}), 404
-    return send_file(str(merged_path.resolve()), as_attachment=True, download_name="merged_markdown.md")
+    return send_file(str(merged_path), as_attachment=True, download_name="merged_markdown.md")
 
 
 @app.route("/preview/<job_id>/<filename>")
 def preview(job_id, filename):
-    """Get markdown content for preview."""
-    file_path = OUTPUT_DIR / job_id / filename
-    if not file_path.exists() or not file_path.is_file():
+    """Get preview content from a validated Markdown output file."""
+    file_path = resolve_job_file(OUTPUT_DIR, job_id, filename)
+    if file_path is None or not file_path.is_file() or file_path.suffix.lower() != ".md":
         return jsonify({"error": "File not found"}), 404
     content = file_path.read_text(encoding="utf-8")
-    # Truncate for preview
     if len(content) > 50000:
         content = content[:50000] + "\n\n... [truncated for preview] ..."
-    return jsonify({"content": content, "filename": filename})
-
+    return jsonify({"content": content, "filename": file_path.name})
 
 # ─── HTML Template ───────────────────────────────────────────────────────────
 
@@ -1252,7 +1422,6 @@ body::before {
                 <div style="display:flex;gap:0.6rem;margin-top:0.6rem;align-items:center;">
                     <label style="flex:1; font-size:0.85rem; color:var(--text-dim);">DPI para OCR:</label>
                     <input id="ocrDpi" type="number" min="72" max="600" value="300" style="width:110px;padding:0.4rem;border-radius:6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);" />
-                    <label style="margin-left:0.6rem; font-size:0.85rem;"><input id="ocrPreprocess" type="checkbox" style="margin-right:0.35rem;"> Mejorar imágenes (preprocesar)</label>
                 </div>
                 <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 0.35rem; line-height: 1.4;">
                     <strong>Auto</strong> evalúa cada página y activa OCR solo en las páginas escaneadas. Aumentar DPI mejora la precisión del OCR, pero aumenta el tiempo.
@@ -1318,6 +1487,10 @@ body::before {
                 📦 <strong>Descargar todo (.zip)</strong><br>
                 <span style="font-size: 0.75rem; opacity: 0.8;">Archivos individuales e imágenes</span>
             </button>
+            <button class="btn btn-secondary" id="retryErrorsBtn" onclick="retryErrors()" style="display:none; flex: 1; padding: 1rem; border-radius: 12px; font-size: 1.05rem;">
+                ↻ <strong>Reintentar errores</strong><br>
+                <span style="font-size: 0.75rem; opacity: 0.8;">Solo vuelve a procesar los archivos fallidos</span>
+            </button>
         </div>
 
     </div>
@@ -1327,7 +1500,7 @@ body::before {
         <div class="dropzone" id="dropzoneExport" onclick="document.getElementById('fileInputExport').click()">
             <span class="dropzone-icon">📤</span>
             <h3>Convierte Markdown a PDF o Word</h3>
-            <p>Admite Markdown normal y Obsidian · agrega imágenes referenciadas si las necesitas</p>
+            <p>Admite Markdown estándar · agrega imágenes referenciadas si las necesitas</p>
         </div>
         <input type="file" id="fileInputExport" accept=".md,.markdown,.png,.jpg,.jpeg,.gif,.webp,.svg" multiple>
 
@@ -1581,6 +1754,14 @@ function formatSize(bytes) {
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
 
 function isConvertibleFile(file) {
     return /\.(pdf|docx|docm)$/i.test(file.name);
@@ -1597,7 +1778,7 @@ function renderQueue() {
         div.className = 'file-item';
         div.innerHTML = `
             <span class="icon">📄</span>
-            <span class="name" title="${f.name}">${f.name}</span>
+            <span class="name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>
             <span class="size">${formatSize(f.size)}</span>
             <button class="remove-btn" onclick="removeFile(${i})" title="Quitar">×</button>
         `;
@@ -1621,7 +1802,7 @@ function renderMdQueue() {
         div.className = 'file-item';
         div.innerHTML = `
             <span class="icon">📝</span>
-            <span class="name" title="${f.name}">${f.name}</span>
+            <span class="name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>
             <span class="size">${formatSize(f.size)}</span>
             <button class="remove-btn" onclick="removeMdFile(${i})" title="Quitar">×</button>
         `;
@@ -1646,7 +1827,7 @@ function renderExportQueue() {
         div.className = 'file-item';
         div.innerHTML =
             '<span class="icon">' + (isMd ? '📝' : '🖼️') + '</span>' +
-            '<span class="name" title="' + file.name + '">' + file.name + '</span>' +
+            '<span class="name" title="' + escapeHtml(file.name) + '">' + escapeHtml(file.name) + '</span>' +
             '<span class="size">' + formatSize(file.size) + '</span>' +
             '<button class="remove-btn" onclick="removeExportFile(' + index + ')" title="Quitar">×</button>';
         fileQueueExport.appendChild(div);
@@ -1673,7 +1854,6 @@ async function startConversion() {
     formData.append('optHeaders', document.getElementById('optHeaders').checked);
     formData.append('ocrMode', document.getElementById('ocrMode').value);
     formData.append('ocrDpi', document.getElementById('ocrDpi').value);
-    formData.append('ocrPreprocess', document.getElementById('ocrPreprocess').checked);
 
     try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
@@ -1690,7 +1870,7 @@ async function startConversion() {
         document.getElementById('progressContainer').classList.add('active');
 
         // Start polling
-        pollInterval = setInterval(pollStatus, 800);
+        pollInterval = setInterval(pollStatus, 2500);
 
     } catch (err) {
         alert('Error de conexión: ' + err.message);
@@ -1731,7 +1911,7 @@ async function startExport() {
                 return '<a class="btn btn-secondary" style="padding:0.3rem 0.65rem;text-decoration:none;" href="/download/' +
                     data.id + '/' + encodeURIComponent(output.filename) + '">↓ ' + output.format + '</a>';
             }).join('');
-            div.innerHTML = '<span class="icon">📄</span><span class="name">' + file.original_name +
+            div.innerHTML = '<span class="icon">📄</span><span class="name">' + escapeHtml(file.original_name) +
                 '</span><span class="status-badge status-' + file.status + '">' +
                 (file.status === 'done' ? '✓ Listo' : '✗ Error') +
                 '</span><span style="display:flex;gap:0.35rem;">' + links + '</span>';
@@ -1822,22 +2002,19 @@ function updateUI(job) {
             actions =
                 '<a href="/download/' + job.id + '/' + encodeURIComponent(f.output) +
                 '" class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;text-decoration:none;">↓ MD</a>' +
-                (f.output_obsidian ?
-                    '<a href="/download/' + job.id + '/' + encodeURIComponent(f.output_obsidian) +
-                    '" class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;text-decoration:none;">↓ Obsidian</a>' : '') +
                 '<button class="btn btn-secondary" style="padding:0.25rem 0.6rem;font-size:0.72rem;" onclick="showPreview(' +
                 "'" + job.id + "','" + f.output + "'" + ')">👁</button>';
         }
         if (f.status === 'error') {
             actions = '<span style="color:var(--red);font-size:0.72rem;" title="' +
-                (f.error || '') + '">ver error</span>';
+                escapeHtml(f.error || '') + '">ver error</span>';
         }
 
         let timeInfo = f.time ? `${f.time}s` : '';
 
         div.innerHTML = `
             <span class="icon">📄</span>
-            <span class="name" title="${f.original_name}">${f.original_name}</span>
+            <span class="name" title="${escapeHtml(f.original_name)}">${escapeHtml(f.original_name)}</span>
             <span class="status-badge ${statusClass}">${statusLabel}${timeInfo ? ' · ' + timeInfo : ''}</span>
             <span style="display:flex;gap:0.3rem;align-items:center;">${actions}</span>
         `;
@@ -1850,6 +2027,8 @@ function updateUI(job) {
         document.getElementById('statTotal').textContent = job.total;
         const done = job.files.filter(f => f.status === 'done').length;
         const errors = job.files.filter(f => f.status === 'error').length;
+        const retryButton = document.getElementById('retryErrorsBtn');
+        retryButton.style.display = errors > 0 && job.status === 'done' ? 'inline-flex' : 'none';
         const totalTime = job.files.reduce((s, f) => s + (f.time || 0), 0);
         document.getElementById('statDone').textContent = done;
         document.getElementById('statErrors').textContent = errors;
@@ -1858,16 +2037,33 @@ function updateUI(job) {
 }
 
 // ── Download All ──
+async function retryErrors() {
+    if (!currentJobId) return;
+    const button = document.getElementById('retryErrorsBtn');
+    button.disabled = true;
+    try {
+        const response = await fetch(`/retry-errors/${currentJobId}`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'No fue posible reintentar');
+        document.getElementById('resultsActions').classList.remove('active');
+        document.getElementById('convertBtn').innerHTML = '⏳ Convirtiendo...';
+        pollInterval = setInterval(pollStatus, 2500);
+    } catch (error) {
+        alert('Error: ' + error.message);
+    } finally {
+        button.disabled = false;
+    }
+}
+
 function downloadAll() {
     if (currentJobId) {
         window.location.href = `/download-all/${currentJobId}`;
     }
 }
 
-function downloadCombined(format) {
+function downloadCombined() {
     if (currentJobId) {
-        const suffix = format === 'obsidian' ? '?format=obsidian' : '';
-        window.location.href = '/download-combined/' + currentJobId + suffix;
+        window.location.href = '/download-combined/' + currentJobId;
     }
 }
 
@@ -1911,6 +2107,12 @@ function toggleOptions() {
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    for resumable_job_id in load_job_snapshots():
+        threading.Thread(
+            target=run_batch_conversion,
+            args=(resumable_job_id,),
+            daemon=True,
+        ).start()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     print(f"""
 +----------------------------------------------------+
@@ -1919,7 +2121,7 @@ if __name__ == "__main__":
 |   Ctrl+C para detener                            |
 +----------------------------------------------------+
     """)
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
 
 
 

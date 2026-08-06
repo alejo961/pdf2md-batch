@@ -1,14 +1,10 @@
-﻿# PDF2MD · Conversor documental
+# PDF2MD · Conversor documental
 
-Aplicación web local para transformar documentos entre PDF, Word y Markdown, con soporte específico para Obsidian.
+Aplicación web local para transformar documentos entre PDF, Word y Markdown.
 
 ## Funciones principales
 
 - Convierte PDF, DOCX y DOCM a Markdown estándar.
-- Genera simultáneamente una nota Obsidian Flavored Markdown (.obsidian.md).
-- Las notas de Obsidian incluyen propiedades YAML, tags, alias, wikilinks y embeds compatibles.
-- Convierte Markdown estándar u Obsidian a PDF maquetado y buscable.
-- Convierte Markdown estándar u Obsidian a Word editable (.docx).
 - Conserva títulos, negrita, cursiva, listas, tablas, citas, callouts, enlaces y bloques de código.
 - Permite descargar archivos individuales, documentos combinados o paquetes ZIP.
 - Ejecuta todo localmente: los documentos no se envían a servicios externos.
@@ -45,10 +41,7 @@ chmod +x run.sh
 1. Abre la pestaña **Convertir archivos**.
 2. Agrega PDF, DOCX o DOCM.
 3. Ajusta OCR e imágenes si lo necesitas.
-4. Convierte y elige entre:
-   - **MD estándar**, compatible con CommonMark/GitHub.
-   - **Obsidian MD**, con frontmatter, wikilinks y embeds.
-   - ZIP con ambas variantes y sus imágenes.
+4. Convierte y descarga los MD estándar individuales, el documento combinado o el ZIP.
 
 ### Markdown → PDF o Word
 
