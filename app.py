@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 PDF2MD Batch Converter
 =====================
@@ -13,6 +13,7 @@ Usage:
 import os
 import sys
 import json
+import re
 import time
 import zipfile
 import shutil
@@ -59,6 +60,25 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 WORD_EXTENSIONS = {".docx", ".docm"}
 SUPPORTED_CONVERT_EXTENSIONS = {".pdf", *WORD_EXTENSIONS}
 
+
+def configure_tesseract() -> Path | None:
+    """Locate a local Tesseract installation so PyMuPDF OCR can use it."""
+    configured = os.environ.get("TESSDATA_PREFIX")
+    candidates = [
+        Path(configured) if configured else None,
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tessdata",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Tesseract-OCR" / "tessdata",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Tesseract-OCR" / "tessdata",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_dir() and (candidate / "eng.traineddata").is_file():
+            os.environ["TESSDATA_PREFIX"] = str(candidate)
+            return candidate
+    return None
+
+
+TESSDATA_DIR = configure_tesseract()
+
 # Track conversion jobs
 jobs = {}
 jobs_lock = threading.Lock()
@@ -66,30 +86,11 @@ jobs_lock = threading.Lock()
 
 # ─── Utility Logic ───────────────────────────────────────────────────────────
 
-def is_pdf_scanned(pdf_path: Path) -> bool:
-    """Check if the PDF is likely scanned (contains no text)."""
-    try:
-        doc = fitz.open(str(pdf_path))
-        # Check first few pages
-        for i in range(min(5, len(doc))):
-            page = doc[i]
-            # If page is searchable or has significant text, it's not scanned
-            if hasattr(page, "is_searchable"):
-                if page.is_searchable():
-                    return False
-
-            text = page.get_text().strip()
-            if len(text) > 100:  # Threshold for "real" text
-                return False
-        return True
-    except Exception as e:
-        print(f"Error detecting scanned status for {pdf_path}: {e}")
-        return True  # Default to true/scanned if error
-    finally:
-        if 'doc' in locals():
-            doc.close()
-
-
+def page_has_usable_text(page, minimum_characters: int = 40) -> bool:
+    """Return whether a PDF page has enough native text to skip OCR."""
+    text = page.get_text("text") or ""
+    compact_text = re.sub(r"\s+", "", text)
+    return len(compact_text) >= minimum_characters
 def is_supported_convert_file(filename: str) -> bool:
     """Return True when the file can be converted to Markdown."""
     return Path(filename).suffix.lower() in SUPPORTED_CONVERT_EXTENSIONS
@@ -144,6 +145,97 @@ def docx_paragraph_to_markdown(paragraph) -> str:
     return text
 
 
+def is_image_only_markdown(markdown_text: str) -> bool:
+    """Detect output that points to extracted page images instead of text."""
+    stripped = markdown_text.strip()
+    if not stripped:
+        return True
+
+    markdown_images = re.findall(r"!\[[^\]]*\]\([^)]*\)", stripped)
+    obsidian_images = re.findall(r"!\[\[[^\]]+\]\]", stripped)
+    image_refs = markdown_images + obsidian_images
+    if not image_refs:
+        return False
+
+    without_images = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", stripped)
+    without_images = re.sub(r"!\[\[[^\]]+\]\]", "", without_images)
+    without_rules = re.sub(r"[-_=]{3,}", "", without_images)
+    words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{3,}", without_rules)
+    return len(words) < 10
+
+
+def ocr_page_to_markdown(page, page_number: int, dpi: int) -> str:
+    """Run OCR on one page and return plain Markdown text for that page."""
+    try:
+        try:
+            textpage = page.get_textpage_ocr(language="spa+eng", dpi=dpi, full=True)
+        except Exception:
+            textpage = page.get_textpage_ocr(language="eng", dpi=dpi, full=True)
+        return page.get_text("text", textpage=textpage).strip()
+    except Exception as exc:
+        raise RuntimeError(
+            f"No se pudo hacer OCR en la página {page_number}. Instala Tesseract OCR y "
+            "sus idiomas spa/eng, o agrega tesseract.exe al PATH. Detalle: " + str(exc)
+        ) from exc
+
+
+def pdf_to_markdown_page_by_page(pdf_path: Path, output_path: Path, options: dict) -> str:
+    """Convert every page independently, applying OCR only where required."""
+    ocr_mode = options.get("ocr_mode", "auto")
+    dpi = int(options.get("ocr_dpi") or 300)
+    write_images = bool(options.get("extract_images", False))
+    page_blocks = []
+
+    with fitz.open(str(pdf_path)) as doc:
+        for page_index, page in enumerate(doc):
+            page_number = page_index + 1
+            should_ocr = ocr_mode == "force" or (
+                ocr_mode == "auto" and not page_has_usable_text(page) and bool(page.get_images(full=True))
+            )
+
+            page_markdown = ""
+            if not should_ocr:
+                page_markdown = pymupdf4llm.to_markdown(
+                    str(pdf_path),
+                    pages=[page_index],
+                    write_images=write_images,
+                    image_path=str(output_path.parent / "images"),
+                    image_format="png",
+                    dpi=min(dpi, 300),
+                    use_ocr=False,
+                    header=not options.get("exclude_headers", False),
+                    footer=not options.get("exclude_headers", False),
+                ).strip()
+
+                # A scanned page can contain a tiny digital stamp or page number.
+                # If extraction still yields only PNG links, retry that page with OCR.
+                if is_image_only_markdown(page_markdown):
+                    if ocr_mode == "none":
+                        raise RuntimeError(
+                            f"La página {page_number} solo produjo referencias a imágenes. "
+                            "Activa OCR automático o forzado para extraer su texto."
+                        )
+                    should_ocr = True
+
+            if should_ocr:
+                page_markdown = ocr_page_to_markdown(page, page_number, dpi)
+                if not page_markdown:
+                    # Truly blank pages are valid; image pages with no OCR text are not.
+                    if page.get_images(full=True):
+                        raise RuntimeError(
+                            f"OCR no devolvió texto en la página {page_number}. "
+                            "Verifica la calidad del escaneo y la instalación de Tesseract."
+                        )
+                    page_markdown = "_Página sin texto reconocible._"
+
+            page_blocks.append(f"## Página {page_number}\n\n{page_markdown}".strip())
+
+    markdown_text = "\n\n---\n\n".join(page_blocks).strip()
+    if not markdown_text or is_image_only_markdown(markdown_text):
+        raise RuntimeError(
+            "La conversión no produjo texto; se evitó crear un Markdown con una lista de imágenes."
+        )
+    return markdown_text + "\n"
 def docx_table_to_markdown(table) -> str:
     """Convert a Word table to GitHub-flavored Markdown."""
     rows = []
@@ -178,33 +270,12 @@ def docx_table_to_markdown(table) -> str:
 # ─── Conversion Logic ────────────────────────────────────────────────────────
 
 def convert_pdf_to_md(pdf_path: Path, output_path: Path, job_id: str, file_index: int, options: dict = None):
-    """Convert a single PDF file to Markdown using pymupdf4llm."""
+    """Convert a PDF page by page, with per-page automatic OCR."""
     options = options or {}
     start_time = time.time()
 
-    ocr_mode = options.get("ocr_mode", "auto")
-    use_ocr = False
-
-    # Determine if we need OCR
-    if ocr_mode == "force":
-        use_ocr = True
-    elif ocr_mode == "auto":
-        use_ocr = is_pdf_scanned(pdf_path)
-
-    # Choose DPI: higher DPI improves OCR quality but increases processing time
-    dpi = int(options.get("ocr_dpi") or (300 if use_ocr else 150))
-    preprocess = options.get("ocr_preprocess", False)
-
     try:
-        md_text = pymupdf4llm.to_markdown(
-            str(pdf_path),
-            write_images=options.get("extract_images", True),
-            image_path=str(output_path.parent / "images"),
-            image_format="png",
-            dpi=dpi,
-            force_ocr=use_ocr
-        )
-
+        md_text = pdf_to_markdown_page_by_page(pdf_path, output_path, options)
         outputs = write_markdown_variants(md_text, output_path, pdf_path.name)
         elapsed = round(time.time() - start_time, 2)
 
@@ -1145,7 +1216,7 @@ body::before {
         <div class="options-panel" id="optionsPanel">
             <h4>Opciones de conversión</h4>
             <div class="option-row">
-                <label><input type="checkbox" id="optImages" checked> Extraer imágenes (PNG)</label>
+                <label><input type="checkbox" id="optImages"> Extraer imágenes embebidas (no recomendado para escaneados)</label>
             </div>
             <div class="option-row">
                 <label><input type="checkbox" id="optHeaders" checked> Excluir encabezados/pies repetitivos</label>
@@ -1163,7 +1234,7 @@ body::before {
                     <label style="margin-left:0.6rem; font-size:0.85rem;"><input id="ocrPreprocess" type="checkbox" style="margin-right:0.35rem;"> Mejorar imágenes (preprocesar)</label>
                 </div>
                 <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 0.35rem; line-height: 1.4;">
-                    <strong>Auto</strong> solo activa el motor de OCR si el documento parece estar escaneado. Aumentar DPI mejora la precisión del OCR, pero aumenta el tiempo.
+                    <strong>Auto</strong> evalúa cada página y activa OCR solo en las páginas escaneadas. Aumentar DPI mejora la precisión del OCR, pero aumenta el tiempo.
                 </p>
             </div>
         </div>
