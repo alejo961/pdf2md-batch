@@ -82,6 +82,9 @@ TESSDATA_DIR = configure_tesseract()
 # Track conversion jobs
 jobs = {}
 jobs_lock = threading.Lock()
+ocr_lock = threading.Lock()
+OCR_MAX_ATTEMPTS = 3
+OCR_RETRY_DELAY_SECONDS = 0.5
 
 
 # ─── Utility Logic ───────────────────────────────────────────────────────────
@@ -165,19 +168,37 @@ def is_image_only_markdown(markdown_text: str) -> bool:
 
 
 def ocr_page_to_markdown(page, page_number: int, dpi: int) -> str:
-    """Run OCR on one page and return plain Markdown text for that page."""
-    try:
-        try:
-            textpage = page.get_textpage_ocr(language="spa+eng", dpi=dpi, full=True)
-        except Exception:
-            textpage = page.get_textpage_ocr(language="eng", dpi=dpi, full=True)
-        return page.get_text("text", textpage=textpage).strip()
-    except Exception as exc:
-        raise RuntimeError(
-            f"No se pudo hacer OCR en la página {page_number}. Instala Tesseract OCR y "
-            "sus idiomas spa/eng, o agrega tesseract.exe al PATH. Detalle: " + str(exc)
-        ) from exc
+    """Run thread-safe OCR on one page, retrying temporary Leptonica failures."""
+    last_error = None
 
+    for attempt in range(1, OCR_MAX_ATTEMPTS + 1):
+        try:
+            # PyMuPDF invokes Leptonica in-process. Leptonica rejects concurrent
+            # calls, so only the OCR section is serialized; digital extraction
+            # and the rest of each PDF conversion remain parallel.
+            with ocr_lock:
+                try:
+                    textpage = page.get_textpage_ocr(
+                        language="spa+eng", dpi=dpi, full=True
+                    )
+                except Exception as spanish_error:
+                    if "Leptonica from 2 threads" in str(spanish_error):
+                        raise
+                    textpage = page.get_textpage_ocr(
+                        language="eng", dpi=dpi, full=True
+                    )
+                return page.get_text("text", textpage=textpage).strip()
+        except Exception as exc:
+            last_error = exc
+            is_temporary = "Leptonica from 2 threads" in str(exc)
+            if not is_temporary or attempt == OCR_MAX_ATTEMPTS:
+                break
+            time.sleep(OCR_RETRY_DELAY_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"No se pudo hacer OCR en la página {page_number}. Tesseract está instalado, "
+        "pero el motor OCR no pudo procesar esta página. Detalle: " + str(last_error)
+    ) from last_error
 
 def pdf_to_markdown_page_by_page(pdf_path: Path, output_path: Path, options: dict) -> str:
     """Convert every page independently, applying OCR only where required."""
