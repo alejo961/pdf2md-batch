@@ -89,7 +89,7 @@ if not exist "%APP_PY%" (
     exit /b 1
 )
 
-"%APP_PY%" -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx" >nul 2>nul
+"%APP_PY%" -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx, striprtf" >nul 2>nul
 if not errorlevel 1 goto deps_ready
 
 "%APP_PY%" -m pip --version >nul 2>nul
@@ -102,7 +102,7 @@ if errorlevel 1 (
     )
 )
 
-"%APP_PY%" -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx" >nul 2>nul
+"%APP_PY%" -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx, striprtf" >nul 2>nul
 if not errorlevel 1 goto deps_ready
 
 echo Instalando/validando dependencias...
@@ -137,7 +137,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%APP_PY%" -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx" >nul 2>nul
+"%APP_PY%" -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx, striprtf" >nul 2>nul
 if errorlevel 1 (
     echo Las dependencias no quedaron instaladas correctamente.
     pause
@@ -165,7 +165,7 @@ set "FIRST_PYTHON_CMD="
 where py >nul 2>nul
 if not errorlevel 1 (
     set "FIRST_PYTHON_CMD=py -3"
-    py -3 -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx" >nul 2>nul
+    py -3 -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx, striprtf" >nul 2>nul
     if not errorlevel 1 (
         set "PYTHON_CMD=py -3"
         exit /b 0
@@ -175,7 +175,7 @@ if not errorlevel 1 (
 where python >nul 2>nul
 if not errorlevel 1 (
     if "%FIRST_PYTHON_CMD%"=="" set "FIRST_PYTHON_CMD=python"
-    python -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx" >nul 2>nul
+    python -c "import flask, pymupdf4llm, fitz, markdown, bs4, docx, striprtf" >nul 2>nul
     if not errorlevel 1 (
         set "PYTHON_CMD=python"
         exit /b 0

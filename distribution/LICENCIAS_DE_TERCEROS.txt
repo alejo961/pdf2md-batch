@@ -1,0 +1,30 @@
+PDF2MD 1.0.3 - Avisos de terceros
+=================================
+
+PDF2MD distribuye componentes de código abierto. Los documentos del usuario se
+procesan localmente y no se envían a los proyectos enumerados a continuación.
+
+- Python: Python Software Foundation License 2.0
+  https://docs.python.org/3/license.html
+- Tesseract OCR integrado en PyMuPDF y sus datos de idioma: Apache License 2.0
+  https://github.com/tesseract-ocr/tesseract/blob/main/LICENSE
+- tessdata (spa, eng, osd): Apache License 2.0
+  https://github.com/tesseract-ocr/tessdata/blob/main/LICENSE
+- PyMuPDF y PyMuPDF4LLM: GNU Affero General Public License v3 o licencia comercial,
+  según los términos publicados por Artifex.
+  https://pymupdf.readthedocs.io/en/latest/about.html#license
+- Flask, Werkzeug, Waitress, Jinja2, Click e ItsDangerous: BSD-3-Clause o BSD derivados.
+- python-docx: MIT License.
+- Python-Markdown: BSD License.
+- Beautiful Soup: MIT License.
+- Pillow: HPND License.
+- pystray: LGPL-3.0-or-later.
+
+Las distribuciones instaladas conservan los archivos LICENSE/METADATA incluidos
+por cada paquete de Python. Este aviso no sustituye los textos de licencia que
+acompañan a dichos componentes.
+
+El archivo CODIGO_FUENTE_PDF2MD_1.0.3.zip incluido con la instalación contiene
+el código de esta aplicación, sus pruebas y los scripts necesarios para volver
+a construirla. Quien distribuya PDF2MD debe revisar si requiere una licencia
+comercial de PyMuPDF o si distribuirá el trabajo completo conforme a AGPL v3.

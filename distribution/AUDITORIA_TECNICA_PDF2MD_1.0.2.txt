@@ -1,0 +1,20 @@
+AUDITORIA TECNICA OFFLINE - PDF2MD
+========================================
+Paquete: C:\Users\AERODRIGUEZ\Downloads\pdf2md_batch\dist\PDF2MD
+Archivos: 196
+Tamaño: 295135933 bytes
+Binarios PE revisados: 66
+SHA-256 del ejecutable interno: 72d3175ea23733dedb3b0e0df9cf1660091d43b9a6dff433f9b81c850255ac87
+Resultado: APROBADO
+
+Archivos esenciales faltantes:
+[]
+
+Dependencias DLL no resueltas:
+{}
+
+Errores al analizar binarios:
+{}
+
+Direcciones externas encontradas en el código de ejecución:
+[]

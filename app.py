@@ -2,7 +2,7 @@
 """
 PDF2MD Batch Converter
 =====================
-Local web application for batch converting PDF and Word files to Markdown.
+Local web application for batch converting PDF, Word and RTF files to Markdown.
 Uses pymupdf4llm for high-quality extraction with table, image, and header support.
 
 Usage:
@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import platform
 import sys
 import json
 import re
@@ -18,8 +19,13 @@ import time
 import zipfile
 import shutil
 import threading
+import copy
+import logging
+import subprocess
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 
@@ -33,6 +39,17 @@ import fitz
 
 from conversion_formats import (
     markdown_to_docx, markdown_to_pdf,
+)
+from runtime_config import (
+    APP_VERSION,
+    DATA_DIR,
+    DATA_RETENTION_DAYS,
+    LOG_DIR,
+    OUTPUT_DIR,
+    UPLOAD_DIR,
+    configure_tesseract,
+    ensure_runtime_directories,
+    resource_root,
 )
 
 try:
@@ -48,37 +65,45 @@ except ImportError:
     Table = None
     Paragraph = None
 
+try:
+    from striprtf.striprtf import rtf_to_text
+except ImportError:
+    rtf_to_text = None
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB max total upload
+# Uploads are sent one file at a time by the desktop UI. Keep a generous
+# per-request ceiling for unusually large legal records and for compatibility
+# with older browser pages that still send a whole batch in one request.
+MAX_UPLOAD_REQUEST_BYTES = 8 * 1024 * 1024 * 1024
+MIN_FREE_SPACE_AFTER_UPLOAD = 256 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_REQUEST_BYTES
 
-UPLOAD_DIR = Path("uploads")
-OUTPUT_DIR = Path("output")
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
+ensure_runtime_directories()
+
+LOG_FILE = LOG_DIR / "pdf2md.log"
+log_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(threadName)s | %(message)s"
+))
+app.logger.setLevel(logging.INFO)
+if not any(isinstance(handler, RotatingFileHandler) for handler in app.logger.handlers):
+    app.logger.addHandler(log_handler)
 
 WORD_EXTENSIONS = {".docx", ".docm"}
-SUPPORTED_CONVERT_EXTENSIONS = {".pdf", *WORD_EXTENSIONS}
-
-
-def configure_tesseract() -> Path | None:
-    """Locate a local Tesseract installation so PyMuPDF OCR can use it."""
-    configured = os.environ.get("TESSDATA_PREFIX")
-    candidates = [
-        Path(configured) if configured else None,
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tessdata",
-        Path(os.environ.get("PROGRAMFILES", "")) / "Tesseract-OCR" / "tessdata",
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Tesseract-OCR" / "tessdata",
-    ]
-    for candidate in candidates:
-        if candidate and candidate.is_dir() and (candidate / "eng.traineddata").is_file():
-            os.environ["TESSDATA_PREFIX"] = str(candidate)
-            return candidate
-    return None
+RTF_EXTENSIONS = {".rtf"}
+SUPPORTED_CONVERT_EXTENSIONS = {".pdf", *WORD_EXTENSIONS, *RTF_EXTENSIONS}
 
 
 TESSDATA_DIR = configure_tesseract()
+ASSET_DIR = resource_root() / "assets"
+if TESSDATA_DIR:
+    app.logger.info("OCR configurado con tessdata en %s", TESSDATA_DIR)
+else:
+    app.logger.warning("No se encontró tessdata en español e inglés")
 
 # Track conversion jobs
 jobs = {}
@@ -86,6 +111,8 @@ jobs_lock = threading.Lock()
 ocr_lock = threading.Lock()
 OCR_MAX_ATTEMPTS = 3
 OCR_RETRY_DELAY_SECONDS = 0.5
+initialization_lock = threading.Lock()
+application_initialized = False
 
 
 def persist_job_snapshot_locked(job_id: str) -> None:
@@ -126,6 +153,48 @@ def load_job_snapshots() -> list[str]:
         except (OSError, ValueError, TypeError):
             continue
     return resumable
+
+
+def cleanup_expired_jobs(retention_days: int = DATA_RETENTION_DAYS) -> int:
+    """Remove old internal jobs while preserving active work and user downloads."""
+    cutoff = time.time() - max(retention_days, 1) * 86400
+    removed = 0
+    for root in (UPLOAD_DIR, OUTPUT_DIR):
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                if child.stat().st_mtime >= cutoff:
+                    continue
+                snapshot = OUTPUT_DIR / child.name / "job.json"
+                if snapshot.is_file():
+                    job = json.loads(snapshot.read_text(encoding="utf-8"))
+                    if job.get("status") in {"running", "packaging"}:
+                        continue
+                shutil.rmtree(child)
+                removed += 1
+            except (OSError, ValueError, TypeError) as exc:
+                app.logger.warning("No se pudo limpiar %s: %s", child, exc)
+    return removed
+
+
+def initialize_application() -> None:
+    """Run safe startup maintenance and resume interrupted conversions once."""
+    global application_initialized
+    with initialization_lock:
+        if application_initialized:
+            return
+        removed = cleanup_expired_jobs()
+        if removed:
+            app.logger.info("Se eliminaron %s carpetas internas antiguas", removed)
+        for resumable_job_id in load_job_snapshots():
+            threading.Thread(
+                target=run_batch_conversion,
+                args=(resumable_job_id,),
+                daemon=True,
+                name=f"resume-{resumable_job_id}",
+            ).start()
+        application_initialized = True
 CONVERSION_MAX_WORKERS = min(os.cpu_count() or 4, 4)
 conversion_executor = ThreadPoolExecutor(max_workers=CONVERSION_MAX_WORKERS)
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -203,6 +272,103 @@ def page_has_usable_text(page, minimum_characters: int = 40) -> bool:
     text = page.get_text("text") or ""
     compact_text = re.sub(r"\s+", "", text)
     return len(compact_text) >= minimum_characters
+
+
+def normalize_marginal_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip().casefold()
+
+
+def detect_repeated_marginal_text(doc) -> set[str]:
+    """Find actual repeated headers/footers instead of cropping page content."""
+    if len(doc) < 2:
+        return set()
+    occurrences = Counter()
+    for page in doc:
+        page_height = float(page.rect.height or 1)
+        seen_on_page = set()
+        for block in page.get_text("blocks", sort=True):
+            if len(block) < 7 or int(block[6]) != 0:
+                continue
+            y0, y1 = float(block[1]), float(block[3])
+            if y1 > page_height * 0.1 and y0 < page_height * 0.9:
+                continue
+            normalized = normalize_marginal_text(str(block[4]))
+            if 3 <= len(normalized) <= 300:
+                seen_on_page.add(normalized)
+        occurrences.update(seen_on_page)
+    threshold = max(2, (len(doc) + 1) // 2)
+    return {text for text, count in occurrences.items() if count >= threshold}
+
+
+def native_page_to_markdown(page, repeated_marginal_text: set[str] | None = None) -> str:
+    """Extract selectable text without invoking the CPU-heavy layout model.
+
+    Digital legal PDFs already contain positioned text. Re-running the neural
+    layout engine on every such page can be slower than OCR on modest CPUs.
+    This path preserves blocks, line order and simple headings while keeping
+    the full native text available for search and citation.
+    """
+    flags = fitz.TEXTFLAGS_DICT | fitz.TEXT_DEHYPHENATE
+    page_dict = page.get_text("dict", flags=flags, sort=True)
+    blocks = [block for block in page_dict.get("blocks", []) if block.get("type") == 0]
+    font_sizes = Counter()
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = str(span.get("text") or "")
+                if text.strip():
+                    font_sizes[round(float(span.get("size") or 0), 1)] += len(text.strip())
+    body_size = font_sizes.most_common(1)[0][0] if font_sizes else 10.0
+    page_height = float(page.rect.height or 1)
+    markdown_blocks = []
+
+    for block in blocks:
+        bbox = block.get("bbox") or (0, 0, 0, 0)
+        lines = []
+        block_sizes = []
+        bold_characters = 0
+        total_characters = 0
+        for line in block.get("lines", []):
+            line_parts = []
+            for span in line.get("spans", []):
+                span_text = str(span.get("text") or "")
+                line_parts.append(span_text)
+                characters = len(span_text.strip())
+                total_characters += characters
+                block_sizes.append(float(span.get("size") or body_size))
+                font_name = str(span.get("font") or "").casefold()
+                if "bold" in font_name or "black" in font_name or "semibold" in font_name:
+                    bold_characters += characters
+            line_text = "".join(line_parts).strip()
+            if line_text:
+                lines.append(line_text)
+        if not lines:
+            continue
+
+        block_text = "\n".join(lines).strip()
+        is_marginal = float(bbox[3]) <= page_height * 0.1 or float(bbox[1]) >= page_height * 0.9
+        if (
+            repeated_marginal_text
+            and is_marginal
+            and normalize_marginal_text(block_text) in repeated_marginal_text
+        ):
+            continue
+        maximum_size = max(block_sizes or [body_size])
+        mostly_bold = total_characters > 0 and bold_characters / total_characters >= 0.6
+        letters = re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", "", block_text)
+        mostly_upper = bool(letters) and sum(char.isupper() for char in letters) / len(letters) >= 0.8
+        is_heading = (
+            len(block_text) <= 180
+            and len(lines) <= 3
+            and (maximum_size >= body_size * 1.22 or (mostly_bold and mostly_upper))
+        )
+        if is_heading:
+            level = 2 if maximum_size >= body_size * 1.55 else 3
+            markdown_blocks.append(f"{'#' * level} {block_text.replace(chr(10), ' ')}")
+        else:
+            markdown_blocks.append(block_text)
+
+    return clean_page_markdown("\n\n".join(markdown_blocks))
 def is_supported_convert_file(filename: str) -> bool:
     """Return True when the file can be converted to Markdown."""
     return Path(filename).suffix.lower() in SUPPORTED_CONVERT_EXTENSIONS
@@ -257,6 +423,33 @@ def docx_paragraph_to_markdown(paragraph) -> str:
     return text
 
 
+def rtf_document_to_markdown(rtf_content: bytes) -> str:
+    """Extract readable text from an RTF document as portable Markdown."""
+    if rtf_to_text is None:
+        raise RuntimeError("striprtf is not installed. Run: pip install striprtf")
+
+    # RTF control words are ASCII. Latin-1 preserves every byte one-to-one so
+    # striprtf can honor the document's own ANSI code-page declaration.
+    source = rtf_content.decode("latin-1")
+    if not source.lstrip().startswith("{\\rtf"):
+        raise ValueError("El archivo no contiene un documento RTF válido.")
+
+    plain_text = rtf_to_text(source, errors="replace")
+    plain_text = plain_text.replace("\r\n", "\n").replace("\r", "\n")
+    markdown_lines = []
+    for raw_line in plain_text.split("\n"):
+        line = raw_line.replace("\t", "    ").strip()
+        if line.startswith(("• ", "· ", "◦ ")):
+            line = f"- {line[2:].strip()}"
+        if line:
+            markdown_lines.append(line)
+
+    markdown_text = "\n\n".join(markdown_lines).strip()
+    if not markdown_text:
+        raise ValueError("El documento RTF no produjo texto reconocible.")
+    return markdown_text + "\n"
+
+
 def is_image_only_markdown(markdown_text: str) -> bool:
     """Detect output that contains image references but no useful text."""
     stripped = (markdown_text or "").strip()
@@ -264,6 +457,142 @@ def is_image_only_markdown(markdown_text: str) -> bool:
         return True
     has_images = bool(re.search(r"!\[[^\]]*\]\([^)]*\)|!\[\[[^\]]+\]\]", stripped))
     return has_images and markdown_semantic_word_count(stripped) < 10
+
+
+def update_file_progress(job_id: str, file_index: int, **changes) -> None:
+    """Publish lightweight per-file progress without rewriting snapshots per page."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job or file_index >= len(job.get("files", [])):
+            return
+        job["files"][file_index].update(changes)
+        job["updated_at"] = datetime.now().isoformat()
+
+
+def friendly_conversion_error(exc: Exception) -> str:
+    """Translate common technical failures into actionable Spanish messages."""
+    detail = str(exc).strip()
+    lowered = detail.casefold()
+    if any(term in lowered for term in ("password", "encrypted", "authenticate", "cifrad")):
+        return "El documento está protegido con contraseña. Abre una copia sin protección e inténtalo de nuevo."
+    if any(term in lowered for term in ("xref", "cannot open", "damaged", "broken", "corrupt")):
+        return "El PDF parece estar dañado o incompleto. Intenta abrirlo y guardarlo nuevamente como PDF."
+    if any(term in lowered for term in ("tesseract", "tessdata", "ocr", "leptonica")):
+        return "No fue posible reconocer el texto de una o más páginas escaneadas. Revisa la calidad del PDF y vuelve a intentarlo."
+    if "no produjo texto" in lowered or "sin texto reconocible" in lowered:
+        return "El documento no contiene texto reconocible. Prueba la opción Forzar OCR si se trata de un escaneo."
+    return "No fue posible convertir este archivo. Puedes reintentarlo o consultar el detalle técnico en Acerca de y ayuda."
+
+
+def conversion_options_from(data) -> dict:
+    """Normalize conversion options from either a form or a JSON object."""
+    try:
+        ocr_dpi = int(data.get("ocrDpi") or 300)
+    except (TypeError, ValueError):
+        ocr_dpi = 300
+    ocr_mode = str(data.get("ocrMode") or "auto")
+    if ocr_mode not in {"auto", "force", "none"}:
+        ocr_mode = "auto"
+
+    def enabled(value) -> bool:
+        return value is True or str(value).casefold() == "true"
+
+    return {
+        "extract_images": enabled(data.get("optImages")),
+        "exclude_headers": enabled(data.get("optHeaders")),
+        "ocr_mode": ocr_mode,
+        "ocr_dpi": max(72, min(ocr_dpi, 600)),
+    }
+
+
+def create_conversion_job(options: dict, status_value: str = "uploading") -> str:
+    """Create a persisted job before receiving its files."""
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8]
+    (UPLOAD_DIR / job_id).mkdir(parents=True, exist_ok=False)
+    with jobs_lock:
+        jobs[job_id] = {
+            "id": job_id,
+            "status": status_value,
+            "created_at": datetime.now().isoformat(),
+            "started_timestamp": None,
+            "finished_at": None,
+            "total": 0,
+            "completed": 0,
+            "files": [],
+            "options": options,
+        }
+        persist_job_snapshot_locked(job_id)
+    return job_id
+
+
+def save_file_in_job(job_id: str, uploaded_file) -> dict:
+    """Save one uploaded document atomically and append it to an upload job."""
+    if not uploaded_file or not uploaded_file.filename:
+        raise ValueError("No se recibió ningún archivo.")
+    if not is_supported_convert_file(uploaded_file.filename):
+        raise ValueError("El archivo no es PDF, Word ni RTF compatible.")
+
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job or job.get("status") != "uploading":
+            raise ValueError("La carga ya no está disponible. Inicia la conversión nuevamente.")
+        used_names = {
+            str(item.get("original_name") or "").casefold()
+            for item in job.get("files", [])
+        }
+        safe_name = unique_upload_name(uploaded_file.filename, used_names)
+
+    job_upload_dir = resolve_job_directory(UPLOAD_DIR, job_id)
+    if job_upload_dir is None:
+        raise ValueError("El identificador de carga no es válido.")
+    job_upload_dir.mkdir(parents=True, exist_ok=True)
+    free_space = shutil.disk_usage(DATA_DIR).free
+    announced_size = max(int(request.content_length or 0), 0)
+    if free_space - announced_size < MIN_FREE_SPACE_AFTER_UPLOAD:
+        raise OSError(
+            "No hay espacio suficiente en el disco para copiar este archivo. "
+            "Libera espacio y vuelve a intentarlo."
+        )
+
+    save_path = job_upload_dir / safe_name
+    partial_path = save_path.with_suffix(save_path.suffix + ".part")
+    try:
+        uploaded_file.save(str(partial_path))
+        os.replace(partial_path, save_path)
+    finally:
+        if partial_path.exists():
+            try:
+                partial_path.unlink()
+            except OSError:
+                pass
+
+    file_info = {
+        "original_name": safe_name,
+        "size": save_path.stat().st_size,
+        "status": "queued",
+        "output": None,
+        "error": None,
+        "time": None,
+        "size_md": None,
+        "type": save_path.suffix.lower().lstrip("."),
+        "current_page": 0,
+        "total_pages": None,
+        "ocr_active": False,
+        "ocr_pages_completed": 0,
+        "extraction_mode": "queued",
+    }
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job or job.get("status") != "uploading":
+            try:
+                save_path.unlink()
+            except OSError:
+                pass
+            raise ValueError("La carga fue cancelada antes de terminar.")
+        job["files"].append(file_info)
+        job["total"] = len(job["files"])
+        persist_job_snapshot_locked(job_id)
+    return file_info
 
 def ocr_page_to_markdown(page, page_number: int, dpi: int) -> str:
     """Run thread-safe OCR on one page, retrying temporary Leptonica failures."""
@@ -298,26 +627,70 @@ def ocr_page_to_markdown(page, page_number: int, dpi: int) -> str:
         "pero el motor OCR no pudo procesar esta página. Detalle: " + str(last_error)
     ) from last_error
 
-def pdf_to_markdown_page_by_page(pdf_path: Path, output_path: Path, options: dict) -> str:
+def pdf_to_markdown_page_by_page(
+    pdf_path: Path,
+    output_path: Path,
+    options: dict,
+    progress_callback=None,
+) -> str:
     """Convert every page independently, applying OCR only where required."""
     ocr_mode = options.get("ocr_mode", "auto")
     dpi = max(72, min(int(options.get("ocr_dpi") or 300), 600))
     write_images = bool(options.get("extract_images", False))
     page_blocks = []
+    ocr_pages_completed = 0
 
     with fitz.open(str(pdf_path)) as doc:
+        total_pages = len(doc)
+        repeated_marginal_text = (
+            detect_repeated_marginal_text(doc)
+            if options.get("exclude_headers", False)
+            else set()
+        )
+        if progress_callback:
+            progress_callback(current_page=0, total_pages=total_pages, ocr_active=False)
         for page_index, page in enumerate(doc):
             page_number = page_index + 1
             native_text = (page.get_text("text") or "").strip()
             page_has_images = bool(page.get_images(full=True))
+            has_usable_native_text = page_has_usable_text(page)
             should_ocr = ocr_mode == "force" or (
                 ocr_mode == "auto"
-                and not page_has_usable_text(page)
+                and not has_usable_native_text
                 and page_has_images
             )
+            page_extraction_mode = "ocr" if should_ocr else "layout"
 
             page_markdown = ""
-            if not should_ocr:
+            if not should_ocr and has_usable_native_text and not write_images:
+                page_extraction_mode = "digital_fast"
+                if progress_callback:
+                    progress_callback(
+                        current_page=page_number,
+                        total_pages=total_pages,
+                        ocr_active=False,
+                        extraction_mode="digital_fast",
+                        ocr_pages_completed=ocr_pages_completed,
+                    )
+                page_markdown = native_page_to_markdown(
+                    page,
+                    repeated_marginal_text=repeated_marginal_text,
+                )
+                # Native text is the authoritative fallback if block formatting
+                # ever omits content from an unusual embedded font.
+                native_words = markdown_semantic_word_count(native_text)
+                if markdown_semantic_word_count(page_markdown) < max(5, int(native_words * 0.75)):
+                    page_markdown = native_text
+            elif not should_ocr:
+                page_extraction_mode = "layout"
+                if progress_callback:
+                    progress_callback(
+                        current_page=page_number,
+                        total_pages=total_pages,
+                        ocr_active=False,
+                        extraction_mode="layout",
+                        ocr_pages_completed=ocr_pages_completed,
+                    )
                 page_markdown = pymupdf4llm.to_markdown(
                     doc,
                     pages=[page_index],
@@ -353,20 +726,38 @@ def pdf_to_markdown_page_by_page(pdf_path: Path, output_path: Path, options: dic
                     should_ocr = True
 
             if should_ocr:
+                page_extraction_mode = "ocr"
+                if progress_callback:
+                    progress_callback(
+                        current_page=page_number,
+                        total_pages=total_pages,
+                        ocr_active=True,
+                        extraction_mode="ocr",
+                        ocr_pages_completed=ocr_pages_completed,
+                    )
                 page_markdown = clean_page_markdown(
                     ocr_page_to_markdown(page, page_number, dpi)
                 )
                 if not page_markdown:
-                    if page_has_images:
+                    if page_has_images and not options.get("allow_empty_ocr_pages", False):
                         raise RuntimeError(
                             f"OCR no devolvió texto en la página {page_number}. "
                             "Verifica la calidad del escaneo."
                         )
                     page_markdown = "_Página sin texto reconocible._"
+                ocr_pages_completed += 1
 
             if not page_markdown:
                 page_markdown = "_Página sin texto reconocible._"
             page_blocks.append(f"## Página {page_number}\n\n{page_markdown}".strip())
+            if progress_callback:
+                progress_callback(
+                    current_page=page_number,
+                    total_pages=total_pages,
+                    ocr_active=False,
+                    extraction_mode=page_extraction_mode,
+                    ocr_pages_completed=ocr_pages_completed,
+                )
 
     markdown_text = "\n\n---\n\n".join(page_blocks).strip()
     if markdown_semantic_word_count(markdown_text) == 0:
@@ -414,7 +805,14 @@ def convert_pdf_to_md(pdf_path: Path, output_path: Path, job_id: str, file_index
     start_time = time.time()
 
     try:
-        md_text = pdf_to_markdown_page_by_page(pdf_path, output_path, options)
+        md_text = pdf_to_markdown_page_by_page(
+            pdf_path,
+            output_path,
+            options,
+            progress_callback=lambda **changes: update_file_progress(
+                job_id, file_index, **changes
+            ),
+        )
         output_name = write_markdown_output(md_text, output_path)
         elapsed = round(time.time() - start_time, 2)
 
@@ -423,13 +821,18 @@ def convert_pdf_to_md(pdf_path: Path, output_path: Path, job_id: str, file_index
             jobs[job_id]["files"][file_index]["output"] = output_name
             jobs[job_id]["files"][file_index]["size_md"] = len(md_text)
             jobs[job_id]["files"][file_index]["time"] = elapsed
+            jobs[job_id]["files"][file_index]["ocr_active"] = False
             jobs[job_id]["completed"] += 1
             persist_job_snapshot_locked(job_id)
 
     except Exception as e:
+        app.logger.exception("Error convirtiendo PDF %s", pdf_path.name)
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "error"
-            jobs[job_id]["files"][file_index]["error"] = str(e)
+            jobs[job_id]["files"][file_index]["error"] = friendly_conversion_error(e)
+            jobs[job_id]["files"][file_index]["technical_error"] = str(e)
+            jobs[job_id]["files"][file_index]["ocr_active"] = False
+            jobs[job_id]["files"][file_index]["time"] = round(time.time() - start_time, 2)
             jobs[job_id]["completed"] += 1
             persist_job_snapshot_locked(job_id)
 
@@ -472,9 +875,37 @@ def convert_word_to_md(word_path: Path, output_path: Path, job_id: str, file_ind
             persist_job_snapshot_locked(job_id)
 
     except Exception as e:
+        app.logger.exception("Error convirtiendo Word %s", word_path.name)
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "error"
-            jobs[job_id]["files"][file_index]["error"] = str(e)
+            jobs[job_id]["files"][file_index]["error"] = friendly_conversion_error(e)
+            jobs[job_id]["files"][file_index]["technical_error"] = str(e)
+            jobs[job_id]["files"][file_index]["time"] = round(time.time() - start_time, 2)
+            jobs[job_id]["completed"] += 1
+            persist_job_snapshot_locked(job_id)
+
+
+def convert_rtf_to_md(rtf_path: Path, output_path: Path, job_id: str, file_index: int):
+    """Convert an RTF file to portable Markdown."""
+    start_time = time.time()
+    try:
+        md_text = rtf_document_to_markdown(rtf_path.read_bytes())
+        output_name = write_markdown_output(md_text, output_path)
+        elapsed = round(time.time() - start_time, 2)
+        with jobs_lock:
+            jobs[job_id]["files"][file_index]["status"] = "done"
+            jobs[job_id]["files"][file_index]["output"] = output_name
+            jobs[job_id]["files"][file_index]["size_md"] = len(md_text)
+            jobs[job_id]["files"][file_index]["time"] = elapsed
+            jobs[job_id]["completed"] += 1
+            persist_job_snapshot_locked(job_id)
+    except Exception as exc:
+        app.logger.exception("Error convirtiendo RTF %s", rtf_path.name)
+        with jobs_lock:
+            jobs[job_id]["files"][file_index]["status"] = "error"
+            jobs[job_id]["files"][file_index]["error"] = friendly_conversion_error(exc)
+            jobs[job_id]["files"][file_index]["technical_error"] = str(exc)
+            jobs[job_id]["files"][file_index]["time"] = round(time.time() - start_time, 2)
             jobs[job_id]["completed"] += 1
             persist_job_snapshot_locked(job_id)
 
@@ -486,10 +917,13 @@ def convert_file_to_md(input_path: Path, output_path: Path, job_id: str, file_in
         convert_pdf_to_md(input_path, output_path, job_id, file_index, options)
     elif suffix in WORD_EXTENSIONS:
         convert_word_to_md(input_path, output_path, job_id, file_index)
+    elif suffix in RTF_EXTENSIONS:
+        convert_rtf_to_md(input_path, output_path, job_id, file_index)
     else:
         with jobs_lock:
             jobs[job_id]["files"][file_index]["status"] = "error"
-            jobs[job_id]["files"][file_index]["error"] = f"Unsupported file type: {suffix}"
+            jobs[job_id]["files"][file_index]["error"] = "Este tipo de archivo no es compatible."
+            jobs[job_id]["files"][file_index]["technical_error"] = f"Unsupported file type: {suffix}"
             jobs[job_id]["completed"] += 1
             persist_job_snapshot_locked(job_id)
 
@@ -544,7 +978,15 @@ def convert_queued_file_to_md(
         job = jobs.get(job_id)
         if job is None:
             return
-        job["files"][file_index]["status"] = "converting"
+        job["files"][file_index].update({
+            "status": "converting",
+            "started_at": datetime.now().isoformat(),
+            "current_page": 0,
+            "total_pages": None,
+            "ocr_active": False,
+            "ocr_pages_completed": 0,
+            "extraction_mode": "queued",
+        })
         persist_job_snapshot_locked(job_id)
     convert_file_to_md(input_path, output_path, job_id, file_index, options)
 
@@ -675,12 +1117,168 @@ def export_markdown_job(md_files, asset_files, export_pdf: bool, export_word: bo
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(
+        HTML_TEMPLATE,
+        app_version=APP_VERSION,
+        support_contact=os.environ.get(
+            "PDF2MD_SUPPORT_CONTACT",
+            "Consulta al docente o a la persona que te compartió la aplicación.",
+        ),
+        log_directory=str(LOG_DIR),
+    )
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "ocr_ready": TESSDATA_DIR is not None,
+    })
+
+
+@app.route("/assets/<path:filename>")
+def packaged_asset(filename):
+    return send_from_directory(str(ASSET_DIR), filename)
+
+
+@app.route("/open-logs", methods=["POST"])
+def open_logs():
+    """Open the local diagnostics directory from the installed application."""
+    try:
+        if os.name == "nt":
+            os.startfile(str(LOG_DIR))
+        else:
+            subprocess.Popen(["xdg-open", str(LOG_DIR)])
+        return jsonify({"status": "ok", "path": str(LOG_DIR)})
+    except OSError as exc:
+        app.logger.exception("No se pudo abrir la carpeta de registros")
+        return jsonify({
+            "error": "No fue posible abrir la carpeta de diagnóstico.",
+            "path": str(LOG_DIR),
+            "detail": str(exc),
+        }), 500
+
+
+@app.route("/diagnostics")
+def diagnostics():
+    """Return copyable local diagnostics without sending anything externally."""
+    disk = shutil.disk_usage(DATA_DIR)
+    sections = [
+        f"PDF2MD {APP_VERSION}",
+        f"Sistema: {platform.platform()}",
+        f"Python: {platform.python_version()}",
+        f"Empaquetado: {bool(getattr(sys, 'frozen', False))}",
+        f"Ejecutable: {sys.executable}",
+        f"Datos: {DATA_DIR}",
+        f"OCR: {TESSDATA_DIR or 'no disponible'}",
+        f"Espacio libre: {disk.free} bytes",
+    ]
+    for name in ("launcher.log", "pdf2md.log", "crash.log"):
+        log_path = LOG_DIR / name
+        if not log_path.is_file():
+            continue
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+            sections.append(f"\n--- {name} (últimas líneas) ---\n" + "\n".join(lines))
+        except OSError as exc:
+            sections.append(f"\n--- {name} ---\nNo se pudo leer: {exc}")
+    return app.response_class("\n".join(sections), mimetype="text/plain; charset=utf-8")
+
+
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify({
+        "error": (
+            "La carga supera el límite de seguridad de 8 GB. "
+            "Divide el lote en dos grupos y vuelve a intentarlo."
+        )
+    }), 413
+
+
+@app.route("/upload/start", methods=["POST"])
+def start_incremental_upload():
+    """Create a job so the browser can upload large batches file by file."""
+    options = conversion_options_from(request.get_json(silent=True) or {})
+    try:
+        job_id = create_conversion_job(options)
+    except OSError as exc:
+        app.logger.exception("No se pudo crear la carga incremental")
+        return jsonify({"error": f"No fue posible preparar la carga: {exc}"}), 500
+    return jsonify({"job_id": job_id, "status": "uploading"})
+
+
+@app.route("/upload/file/<job_id>", methods=["POST"])
+def upload_one_file(job_id):
+    """Receive one file, avoiding a fragile multi-gigabyte HTTP request."""
+    if resolve_job_directory(UPLOAD_DIR, job_id) is None:
+        return jsonify({"error": "La carga ya no existe."}), 404
+    uploaded_file = request.files.get("file")
+    try:
+        file_info = save_file_in_job(job_id, uploaded_file)
+    except (ValueError, OSError) as exc:
+        app.logger.warning("No se pudo cargar un archivo en %s: %s", job_id, exc)
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("Fallo inesperado al guardar un archivo en %s", job_id)
+        return jsonify({
+            "error": (
+                "Windows no permitió guardar el archivo. Revisa el espacio disponible "
+                "o la protección antivirus e inténtalo nuevamente."
+            ),
+            "detail": str(exc),
+        }), 500
+    return jsonify({"status": "uploaded", "file": file_info})
+
+
+@app.route("/upload/finish/<job_id>", methods=["POST"])
+def finish_incremental_upload(job_id):
+    """Start conversion only after every file reached local storage."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "La carga ya no existe."}), 404
+        if job.get("status") != "uploading":
+            return jsonify({"error": "Esta carga ya fue iniciada."}), 409
+        if not job.get("files"):
+            return jsonify({"error": "No se recibió ningún archivo compatible."}), 400
+        job["status"] = "running"
+        job["started_timestamp"] = time.time()
+        job["total"] = len(job["files"])
+        persist_job_snapshot_locked(job_id)
+        total = job["total"]
+    threading.Thread(
+        target=run_batch_conversion,
+        args=(job_id,),
+        daemon=True,
+        name=f"batch-{job_id}",
+    ).start()
+    return jsonify({"job_id": job_id, "total": total, "status": "running"})
+
+
+@app.route("/upload/cancel/<job_id>", methods=["POST"])
+def cancel_incremental_upload(job_id):
+    """Remove only an incomplete upload created by the current browser action."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"status": "absent"})
+        if job.get("status") != "uploading":
+            return jsonify({"error": "La conversión ya comenzó y no se canceló."}), 409
+        jobs.pop(job_id, None)
+    for root in (UPLOAD_DIR, OUTPUT_DIR):
+        target = resolve_job_directory(root, job_id)
+        if target is not None and target.is_dir():
+            try:
+                shutil.rmtree(target)
+            except OSError as exc:
+                app.logger.warning("No se pudo limpiar la carga %s: %s", target, exc)
+    return jsonify({"status": "cancelled"})
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Handle batch PDF/Word upload and start conversion."""
+    """Handle batch PDF/Word/RTF upload and start conversion."""
     files = request.files.getlist("files") or request.files.getlist("pdfs")
     if not files or all(f.filename == "" for f in files):
         return jsonify({"error": "No files uploaded"}), 400
@@ -705,35 +1303,24 @@ def upload():
                 "time": None,
                 "size_md": None,
                 "type": save_path.suffix.lower().lstrip("."),
+                "current_page": 0,
+                "total_pages": None,
+                "ocr_active": False,
+                "ocr_pages_completed": 0,
+                "extraction_mode": "queued",
             })
 
     if not file_list:
-        return jsonify({"error": "No valid PDF or Word files found (.pdf, .docx, .docm)"}), 400
+        return jsonify({"error": "No se encontraron archivos PDF, Word o RTF válidos (.pdf, .docx, .docm, .rtf)"}), 400
 
-    # Options from request
-    # Parse OCR DPI safely
-    ocr_dpi_raw = request.form.get("ocrDpi")
-    try:
-        ocr_dpi = int(ocr_dpi_raw) if ocr_dpi_raw else None
-    except Exception:
-        ocr_dpi = None
-
-    ocr_dpi = max(72, min(ocr_dpi or 300, 600))
-    ocr_mode = request.form.get("ocrMode", "auto")
-    if ocr_mode not in {"auto", "force", "none"}:
-        ocr_mode = "auto"
-    options = {
-        "extract_images": request.form.get("optImages") == "true",
-        "exclude_headers": request.form.get("optHeaders") == "true",
-        "ocr_mode": ocr_mode,
-        "ocr_dpi": ocr_dpi,
-    }
+    options = conversion_options_from(request.form)
 
     with jobs_lock:
         jobs[job_id] = {
             "id": job_id,
             "status": "running",
             "created_at": datetime.now().isoformat(),
+            "started_timestamp": time.time(),
             "finished_at": None,
             "total": len(file_list),
             "completed": 0,
@@ -824,9 +1411,38 @@ def status(job_id):
     if resolve_job_directory(OUTPUT_DIR, job_id) is None:
         return jsonify({"error": "Job not found"}), 404
     with jobs_lock:
-        job = jobs.get(job_id)
+        job = copy.deepcopy(jobs.get(job_id))
     if not job:
         return jsonify({"error": "Job not found"}), 404
+    files = job.get("files", [])
+    done = sum(item.get("status") == "done" for item in files)
+    errors = sum(item.get("status") == "error" for item in files)
+    active = [item for item in files if item.get("status") == "converting"]
+    pending = sum(item.get("status") == "queued" for item in files)
+    started = float(job.get("started_timestamp") or time.time())
+    elapsed = max(0.0, time.time() - started)
+    completed = done + errors
+    partial = 0.0
+    for item in active:
+        total_pages = int(item.get("total_pages") or 0)
+        current_page = int(item.get("current_page") or 0)
+        if total_pages:
+            partial += min(current_page / total_pages, 0.99)
+    total = max(int(job.get("total") or 0), 1)
+    progress_percent = min(100, round(((completed + partial) / total) * 100))
+    eta = None
+    if completed and job.get("status") != "done":
+        eta = max(0, round((elapsed / completed) * (total - completed)))
+    job["progress"] = {
+        "done": done,
+        "errors": errors,
+        "pending": pending,
+        "active": active,
+        "ocr_active": any(item.get("ocr_active") for item in active),
+        "elapsed_seconds": round(elapsed),
+        "eta_seconds": eta,
+        "percent": progress_percent,
+    }
     return jsonify(job)
 
 
@@ -850,11 +1466,18 @@ def retry_errors(job_id):
                     "time": None,
                     "size_md": None,
                     "output": None,
+                    "technical_error": None,
+                    "current_page": 0,
+                    "total_pages": None,
+                    "ocr_active": False,
+                    "ocr_pages_completed": 0,
+                    "extraction_mode": "queued",
                 })
                 retry_count += 1
         if not retry_count:
             return jsonify({"error": "No hay archivos con error para reintentar"}), 400
         job["status"] = "running"
+        job["started_timestamp"] = time.time()
         job["finished_at"] = None
         job["completed"] = sum(
             item.get("status") == "done" for item in job.get("files", [])
@@ -921,9 +1544,11 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF y Word → Markdown · Batch Converter</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+<title>PDF, Word y RTF → Markdown · Batch Converter</title>
 <style>
+@font-face { font-family: 'Outfit'; src: url('/assets/fonts/Outfit-Variable.ttf') format('truetype'); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('/assets/fonts/JetBrainsMono-Regular.ttf') format('truetype'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('/assets/fonts/JetBrainsMono-Bold.ttf') format('truetype'); font-weight: 600 700; font-display: swap; }
 :root {
     --bg: #0a0a0f;
     --surface: #12121a;
@@ -985,6 +1610,20 @@ body::before {
     font-size: 1rem;
     font-weight: 300;
 }
+.help-button {
+    position: absolute;
+    top: 1.25rem;
+    right: 1.5rem;
+    padding: 0.45rem 0.85rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600;
+}
+.help-button:hover { color: var(--text); border-color: var(--accent); }
 .badge {
     display: inline-block;
     margin-top: 0.75rem;
@@ -1227,6 +1866,18 @@ body::before {
     color: var(--text-dim);
     font-family: 'JetBrains Mono', monospace;
 }
+.progress-details {
+    margin-top: 0.65rem;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    line-height: 1.55;
+}
+.progress-details strong { color: var(--text); }
+.progress-details .ocr-notice { color: var(--yellow); }
 
 /* ── Results ── */
 .results-actions {
@@ -1290,6 +1941,27 @@ body::before {
     line-height: 1.7;
     white-space: pre-wrap;
     color: var(--text-dim);
+}
+.help-modal { max-width: 760px; }
+.help-body {
+    white-space: normal;
+    font-family: 'Outfit', sans-serif;
+    font-size: 0.93rem;
+    line-height: 1.6;
+}
+.help-body h4 { color: var(--accent); margin: 1.1rem 0 0.35rem; }
+.help-body h4:first-child { margin-top: 0; }
+.help-body ul, .help-body ol { margin: 0.35rem 0 0.7rem 1.3rem; }
+.help-body code {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+.privacy-note {
+    margin-top: 1rem;
+    padding: 0.8rem;
+    border-left: 3px solid var(--green);
+    background: rgba(52,211,153,0.08);
 }
 
 /* ── Stats ── */
@@ -1361,15 +2033,17 @@ body::before {
     .dropzone { padding: 2rem 1rem; }
     .file-item { grid-template-columns: auto 1fr auto; }
     .file-item .size { display: none; }
+    .help-button { position: static; margin-top: 0.9rem; }
 }
 </style>
 </head>
 <body>
 
 <div class="header">
-    <h1>PDF y Word → Markdown</h1>
+    <h1>PDF, Word y RTF → Markdown</h1>
     <p>Conversión en lote · Local · Sin límites</p>
-    <span class="badge">PDF · Word .docx · tablas · imágenes · multi-columna</span>
+    <span class="badge">PDF · Word .docx/.docm · RTF · tablas · imágenes · multi-columna</span>
+    <button class="help-button" onclick="openHelp()">? Acerca de y ayuda</button>
 </div>
 
 <div class="container">
@@ -1393,10 +2067,10 @@ body::before {
         <!-- Drop Zone -->
         <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
             <span class="dropzone-icon">📄</span>
-            <h3>Arrastra tus archivos PDF o Word aquí</h3>
-            <p>o haz clic para seleccionar · acepta .pdf, .docx y .docm</p>
+            <h3>Arrastra tus archivos PDF, Word o RTF aquí</h3>
+            <p>o haz clic para seleccionar · acepta .pdf, .docx, .docm y .rtf</p>
         </div>
-        <input type="file" id="fileInput" accept=".pdf,.docx,.docm" multiple>
+        <input type="file" id="fileInput" accept=".pdf,.docx,.docm,.rtf" multiple>
 
         <!-- Options toggle -->
         <div style="margin-top: 0.75rem; text-align: right;">
@@ -1452,6 +2126,9 @@ body::before {
                 <span id="progressText">0 / 0 archivos</span>
                 <span id="progressPercent">0%</span>
             </div>
+            <div class="progress-details" id="progressDetails">
+                Preparando la conversión…
+            </div>
         </div>
 
         <!-- Stats -->
@@ -1477,7 +2154,8 @@ body::before {
         <!-- Results actions -->
         <div class="results-actions" id="resultsActions">
             <div style="width: 100%; margin-bottom: 1rem; border-top: 1px solid var(--border); padding-top: 1.5rem;">
-                <h3 style="font-size: 1.1rem; margin-bottom: 1rem; color: var(--accent);">✨ ¡Conversión completada! Elige cómo guardar:</h3>
+                <h3 style="font-size: 1.1rem; margin-bottom: 0.4rem; color: var(--accent);">✨ ¡Conversión completada!</h3>
+                <p style="color: var(--text-dim); font-size: 0.88rem; line-height: 1.5;">Descarga los resultados o inicia otro lote desde aquí, sin actualizar la página.</p>
             </div>
             <button class="btn btn-download" id="downloadCombinedBtn" onclick="downloadCombined()" style="flex: 1; padding: 1rem; border-radius: 12px; font-size: 1.05rem;">
                 📝 <strong>Descargar MD unido</strong><br>
@@ -1490,6 +2168,10 @@ body::before {
             <button class="btn btn-secondary" id="retryErrorsBtn" onclick="retryErrors()" style="display:none; flex: 1; padding: 1rem; border-radius: 12px; font-size: 1.05rem;">
                 ↻ <strong>Reintentar errores</strong><br>
                 <span style="font-size: 0.75rem; opacity: 0.8;">Solo vuelve a procesar los archivos fallidos</span>
+            </button>
+            <button class="btn btn-primary" id="convertMoreBtn" onclick="chooseMoreDocuments()" style="flex: 1 0 100%; padding: 1rem; border-radius: 12px; font-size: 1.05rem;" aria-label="Seleccionar más documentos para iniciar una nueva conversión">
+                ＋ <strong>Convertir más documentos</strong><br>
+                <span style="font-size: 0.75rem; opacity: 0.85;">Selecciona el siguiente lote sin recargar la página</span>
             </button>
         </div>
 
@@ -1594,6 +2276,55 @@ body::before {
     </div>
 </div>
 
+<!-- About and Help Modal -->
+<div class="modal-overlay" id="helpModal">
+    <div class="modal help-modal">
+        <div class="modal-header">
+            <h3>PDF2MD · Acerca de y ayuda</h3>
+            <button class="modal-close" onclick="closeHelp()">×</button>
+        </div>
+        <div class="modal-body help-body">
+            <h4>Uso básico</h4>
+            <ol>
+                <li>Selecciona o arrastra archivos PDF, DOCX, DOCM o RTF.</li>
+                <li>Haz clic en <strong>Convertir todo</strong> y espera la confirmación.</li>
+                <li>Descarga cada Markdown, el documento unido o el paquete ZIP.</li>
+            </ol>
+
+            <h4>Opciones de OCR</h4>
+            <ul>
+                <li><strong>Auto-detectar:</strong> usa extracción rápida en texto digital y reconoce únicamente las páginas escaneadas.</li>
+                <li><strong>Forzar OCR:</strong> procesa todas las páginas como imágenes; úsalo en escaneos difíciles.</li>
+                <li><strong>Desactivado:</strong> es más rápido, pero solo funciona con texto digital seleccionable.</li>
+            </ul>
+
+            <h4>Problemas frecuentes</h4>
+            <ul>
+                <li>Si un PDF pide contraseña, guarda primero una copia sin protección.</li>
+                <li>Si el texto escaneado queda incompleto, prueba Forzar OCR a 300 DPI.</li>
+                <li>Si un archivo falla, utiliza Reintentar errores; los demás continuarán normalmente.</li>
+                <li>Las descargas suelen quedar en la carpeta Descargas configurada en tu navegador.</li>
+            </ul>
+
+            <div class="privacy-note">
+                <strong>Privacidad:</strong> tus documentos se procesan únicamente en este computador.
+                PDF2MD no los envía a internet y no recopila telemetría.
+            </div>
+
+            <h4>Soporte y diagnóstico</h4>
+            <p>{{ support_contact }}</p>
+            <p style="margin-top:0.45rem;">Versión <strong>{{ app_version }}</strong></p>
+            <p style="margin-top:0.45rem;">Registros: <code>{{ log_directory }}</code></p>
+            <button class="btn btn-secondary" style="margin-top:0.8rem;" onclick="openLogFolder()">
+                📁 Abrir carpeta de diagnóstico
+            </button>
+            <button class="btn btn-secondary" style="margin-top:0.8rem;" onclick="copyDiagnostics()">
+                📋 Copiar información de diagnóstico
+            </button>
+        </div>
+    </div>
+</div>
+
 <script>
 // ── State ──
 let pendingFiles = [];
@@ -1601,6 +2332,9 @@ let pendingMdFiles = [];
 let pendingExportFiles = [];
 let currentJobId = null;
 let pollInterval = null;
+let conversionInProgress = false;
+let consecutivePollFailures = 0;
+let pollFailureReported = false;
 
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('fileInput');
@@ -1623,6 +2357,46 @@ function switchTab(tabName) {
     document.getElementById(tabName).classList.add('active');
     document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
 }
+
+function openHelp() {
+    document.getElementById('helpModal').classList.add('active');
+}
+
+function closeHelp() {
+    document.getElementById('helpModal').classList.remove('active');
+}
+
+async function openLogFolder() {
+    try {
+        const response = await fetch('/open-logs', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'No fue posible abrir la carpeta.');
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+async function copyDiagnostics() {
+    try {
+        const response = await fetch('/diagnostics', { cache: 'no-store' });
+        if (!response.ok) throw new Error('No fue posible preparar el diagnóstico.');
+        const diagnostic = await response.text();
+        await navigator.clipboard.writeText(diagnostic);
+        alert('La información de diagnóstico fue copiada. Ya puedes pegarla en tu mensaje de soporte.');
+    } catch (error) {
+        alert('No fue posible copiar automáticamente. Abre la carpeta de diagnóstico y comparte los archivos de registro.');
+    }
+}
+
+document.getElementById('helpModal').addEventListener('click', event => {
+    if (event.target.id === 'helpModal') closeHelp();
+});
+
+window.addEventListener('beforeunload', event => {
+    if (!conversionInProgress) return;
+    event.preventDefault();
+    event.returnValue = 'Hay una conversión activa. Si cierras la aplicación, el proceso podría interrumpirse.';
+});
 
 // ── Drag & Drop PDF ──
 ['dragenter', 'dragover'].forEach(e => {
@@ -1679,7 +2453,12 @@ fileInputExport.addEventListener('change', function() {
 
 // ── File Management ──
 function addFiles(files) {
-    files.forEach(f => {
+    const convertibleFiles = files.filter(isConvertibleFile);
+    if (convertibleFiles.length > 0 && isCompletedConversionVisible()) {
+        resetConversionView();
+        pendingFiles = [];
+    }
+    convertibleFiles.forEach(f => {
         if (!pendingFiles.find(p => p.name === f.name && p.size === f.size)) {
             pendingFiles.push(f);
         }
@@ -1694,12 +2473,44 @@ function removeFile(index) {
 
 function clearAll() {
     pendingFiles = [];
-    currentJobId = null;
-    if (pollInterval) clearInterval(pollInterval);
+    resetConversionView();
     renderQueue();
+}
+
+function isCompletedConversionVisible() {
+    return !conversionInProgress &&
+        document.getElementById('resultsActions').classList.contains('active');
+}
+
+function resetConversionView() {
+    currentJobId = null;
+    if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+    }
+    conversionInProgress = false;
+    consecutivePollFailures = 0;
+    pollFailureReported = false;
+
     document.getElementById('progressContainer').classList.remove('active');
     document.getElementById('statsBar').classList.remove('active');
     document.getElementById('resultsActions').classList.remove('active');
+    document.getElementById('retryErrorsBtn').style.display = 'none';
+
+    document.getElementById('progressBar').style.width = '0%';
+    document.getElementById('progressText').textContent = '0 / 0 archivos';
+    document.getElementById('progressPercent').textContent = '0%';
+    document.getElementById('progressDetails').textContent = 'Preparando la conversión…';
+
+    const convertButton = document.getElementById('convertBtn');
+    convertButton.disabled = false;
+    convertButton.innerHTML = '⚡ Convertir todo';
+}
+
+function chooseMoreDocuments() {
+    // The previous result remains visible if the user cancels the file picker.
+    fileInput.value = '';
+    fileInput.click();
 }
 
 // ── MD File Management ──
@@ -1764,11 +2575,11 @@ function escapeHtml(value) {
 }
 
 function isConvertibleFile(file) {
-    return /\.(pdf|docx|docm)$/i.test(file.name);
+    return /\.(pdf|docx|docm|rtf)$/i.test(file.name);
 }
 
 function fileIcon(filename) {
-    return /\.(docx|docm)$/i.test(filename) ? '\u{1F4DD}' : '\u{1F4C4}';
+    return /\.(docx|docm|rtf)$/i.test(filename) ? '\u{1F4DD}' : '\u{1F4C4}';
 }
 
 function renderQueue() {
@@ -1839,41 +2650,138 @@ function renderExportQueue() {
 }
 
 // ── Conversion ──
+async function fetchJson(url, options) {
+    const response = await fetch(url, options);
+    const raw = await response.text();
+    let data = {};
+    if (raw) {
+        try {
+            data = JSON.parse(raw);
+        } catch (_error) {
+            data = { error: raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() };
+        }
+    }
+    if (!response.ok) {
+        throw new Error(data.error || `PDF2MD respondió con el código ${response.status}.`);
+    }
+    return data;
+}
+
+function showUploadProgress(file, index, total, loaded, fileTotal) {
+    const completed = index;
+    const fraction = fileTotal > 0 ? Math.min(loaded / fileTotal, 1) : 0;
+    const percent = Math.round(((completed + fraction) / Math.max(total, 1)) * 100);
+    document.getElementById('progressBar').style.width = percent + '%';
+    document.getElementById('progressPercent').textContent = percent + '%';
+    document.getElementById('progressText').textContent =
+        `${completed} cargados · ${total - completed} pendientes · 0 errores`;
+    document.getElementById('progressDetails').innerHTML =
+        `<strong>Copiando ${escapeHtml(file.name)}</strong><br>` +
+        `Archivo ${index + 1} de ${total} · ${formatSize(loaded)} de ${formatSize(fileTotal || file.size)}`;
+}
+
+function uploadSingleFile(jobId, file, index, total) {
+    return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('POST', `/upload/file/${jobId}`);
+        request.responseType = 'json';
+        request.upload.addEventListener('progress', event => {
+            showUploadProgress(file, index, total, event.loaded, event.total || file.size);
+        });
+        request.addEventListener('load', () => {
+            const data = request.response || {};
+            if (request.status >= 200 && request.status < 300) {
+                resolve(data || {});
+            } else {
+                reject(new Error((data && data.error) || `No se pudo cargar ${file.name}.`));
+            }
+        });
+        request.addEventListener('error', () => {
+            const error = new Error('Se perdió la conexión con el servidor local durante la carga.');
+            error.connectionLost = true;
+            reject(error);
+        });
+        request.addEventListener('abort', () => reject(new Error('La carga fue cancelada.')));
+        const formData = new FormData();
+        formData.append('file', file);
+        request.send(formData);
+    });
+}
+
+async function explainConnectionFailure(error) {
+    try {
+        const health = await fetch('/health', { cache: 'no-store' });
+        if (health.ok) {
+            return `${error.message}\n\nPDF2MD continúa abierto. Revisa el espacio disponible y vuelve a intentarlo.`;
+        }
+    } catch (_healthError) {
+        // The diagnostic below intentionally handles an unavailable server.
+    }
+    return 'El servidor local de PDF2MD se cerró o fue bloqueado por Windows. ' +
+        'Abre PDF2MD nuevamente desde el escritorio. Si vuelve a ocurrir, comparte la carpeta ' +
+        '%LOCALAPPDATA%\\PDF2MD\\logs con soporte.';
+}
+
 async function startConversion() {
     if (pendingFiles.length === 0) return;
 
     const btn = document.getElementById('convertBtn');
     btn.disabled = true;
     btn.innerHTML = '⏳ Subiendo...';
-
-    const formData = new FormData();
-    pendingFiles.forEach(f => formData.append('files', f));
-
-    // Add options
-    formData.append('optImages', document.getElementById('optImages').checked);
-    formData.append('optHeaders', document.getElementById('optHeaders').checked);
-    formData.append('ocrMode', document.getElementById('ocrMode').value);
-    formData.append('ocrDpi', document.getElementById('ocrDpi').value);
+    conversionInProgress = true;
+    consecutivePollFailures = 0;
+    pollFailureReported = false;
+    document.getElementById('progressContainer').classList.add('active');
 
     try {
-        const res = await fetch('/upload', { method: 'POST', body: formData });
-        const data = await res.json();
-        if (data.error) {
-            alert('Error: ' + data.error);
-            btn.disabled = false;
-            btn.innerHTML = '⚡ Convertir todo';
-            return;
+        const started = await fetchJson('/upload/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                optImages: document.getElementById('optImages').checked,
+                optHeaders: document.getElementById('optHeaders').checked,
+                ocrMode: document.getElementById('ocrMode').value,
+                ocrDpi: document.getElementById('ocrDpi').value,
+            }),
+        });
+        currentJobId = started.job_id;
+
+        for (let index = 0; index < pendingFiles.length; index += 1) {
+            const file = pendingFiles[index];
+            let lastError = null;
+            for (let attempt = 1; attempt <= 2; attempt += 1) {
+                try {
+                    await uploadSingleFile(currentJobId, file, index, pendingFiles.length);
+                    lastError = null;
+                    break;
+                } catch (error) {
+                    lastError = error;
+                    if (!error.connectionLost || attempt === 2) break;
+                    await new Promise(resolve => setTimeout(resolve, 750));
+                }
+            }
+            if (lastError) throw lastError;
         }
 
-        currentJobId = data.job_id;
+        await fetchJson(`/upload/finish/${currentJobId}`, { method: 'POST' });
         btn.innerHTML = '⏳ Convirtiendo...';
-        document.getElementById('progressContainer').classList.add('active');
-
-        // Start polling
+        document.getElementById('progressBar').style.width = '0%';
+        document.getElementById('progressPercent').textContent = '0%';
         pollInterval = setInterval(pollStatus, 2500);
+        await pollStatus();
 
     } catch (err) {
-        alert('Error de conexión: ' + err.message);
+        conversionInProgress = false;
+        if (currentJobId) {
+            try {
+                await fetch(`/upload/cancel/${currentJobId}`, { method: 'POST' });
+            } catch (_cancelError) { /* The server may already be unavailable. */ }
+        }
+        const message = await explainConnectionFailure(err);
+        document.getElementById('progressDetails').innerHTML =
+            `<strong style="color:var(--red);">No se pudo completar la carga.</strong><br>${escapeHtml(message)}`;
+        alert(message);
+        currentJobId = null;
         btn.disabled = false;
         btn.innerHTML = '⚡ Convertir todo';
     }
@@ -1966,22 +2874,68 @@ async function startMerge() {
 async function pollStatus() {
     if (!currentJobId) return;
     try {
-        const res = await fetch(`/status/${currentJobId}`);
-        const job = await res.json();
+        const job = await fetchJson(`/status/${currentJobId}`, { cache: 'no-store' });
+        consecutivePollFailures = 0;
+        pollFailureReported = false;
         updateUI(job);
         if (job.status === 'done') {
             clearInterval(pollInterval);
+            conversionInProgress = false;
             document.getElementById('convertBtn').innerHTML = '✓ Completado';
             document.getElementById('resultsActions').classList.add('active');
         }
-    } catch (e) { /* ignore transient errors */ }
+    } catch (error) {
+        consecutivePollFailures += 1;
+        if (consecutivePollFailures < 3 || pollFailureReported) return;
+        pollFailureReported = true;
+        const message = await explainConnectionFailure(error);
+        document.getElementById('progressDetails').innerHTML =
+            `<strong style="color:var(--red);">Se perdió el seguimiento de la conversión.</strong><br>${escapeHtml(message)}`;
+        alert(message);
+    }
 }
 
 function updateUI(job) {
-    const pct = job.total > 0 ? Math.round((job.completed / job.total) * 100) : 0;
+    const progress = job.progress || {};
+    const pct = Number.isFinite(progress.percent)
+        ? progress.percent
+        : (job.total > 0 ? Math.round((job.completed / job.total) * 100) : 0);
     document.getElementById('progressBar').style.width = pct + '%';
-    document.getElementById('progressText').textContent = `${job.completed} / ${job.total} archivos`;
+    const done = Number.isFinite(progress.done) ? progress.done : job.files.filter(f => f.status === 'done').length;
+    const errors = Number.isFinite(progress.errors) ? progress.errors : job.files.filter(f => f.status === 'error').length;
+    const pending = Number.isFinite(progress.pending) ? progress.pending : job.files.filter(f => f.status === 'queued').length;
+    document.getElementById('progressText').textContent =
+        `${done} completados · ${pending} pendientes · ${errors} errores`;
     document.getElementById('progressPercent').textContent = pct + '%';
+
+    const activeFiles = progress.active || job.files.filter(f => f.status === 'converting');
+    let detailLines = [];
+    activeFiles.forEach(file => {
+        const page = file.current_page || 0;
+        const totalPages = file.total_pages || 0;
+        const pageText = totalPages ? ` · página ${page} de ${totalPages}` : '';
+        const modeText = file.ocr_active || file.extraction_mode === 'ocr'
+            ? ' · aplicando OCR'
+            : (file.extraction_mode === 'digital_fast'
+                ? ' · texto digital rápido'
+                : (file.extraction_mode === 'layout' ? ' · analizando diseño' : ''));
+        detailLines.push(`<strong>${escapeHtml(file.original_name)}</strong>${pageText}` +
+            (modeText ? `<span class="ocr-notice">${modeText}</span>` : ''));
+    });
+    if (job.status === 'packaging') {
+        detailLines = ['<strong>Preparando las descargas…</strong>'];
+    } else if (job.status === 'done') {
+        detailLines = [`<strong>Conversión terminada.</strong> ${done} archivo(s) listo(s)` +
+            (errors ? ` y ${errors} con error.` : '.') +
+            ' Descarga los resultados o pulsa “Convertir más documentos” para iniciar otro lote.'];
+    } else if (!detailLines.length) {
+        detailLines = ['Preparando la cola de conversión…'];
+    }
+    const elapsedText = formatDuration(progress.elapsed_seconds || 0);
+    const etaText = progress.eta_seconds == null ? 'calculando…' : formatDuration(progress.eta_seconds);
+    detailLines.push(`Tiempo transcurrido: ${elapsedText}` +
+        (job.status === 'done' ? '' : ` · Tiempo restante aproximado: ${etaText}`));
+    document.getElementById('progressDetails').innerHTML = detailLines.join('<br>');
 
     // Update file items
     fileQueue.innerHTML = '';
@@ -2011,6 +2965,12 @@ function updateUI(job) {
         }
 
         let timeInfo = f.time ? `${f.time}s` : '';
+        if (f.status === 'converting' && f.total_pages) {
+            statusLabel += ` · pág. ${f.current_page || 0}/${f.total_pages}`;
+            if (f.ocr_active || f.extraction_mode === 'ocr') statusLabel += ' · OCR';
+            else if (f.extraction_mode === 'digital_fast') statusLabel += ' · digital rápido';
+            else if (f.extraction_mode === 'layout') statusLabel += ' · diseño';
+        }
 
         div.innerHTML = `
             <span class="icon">📄</span>
@@ -2025,8 +2985,6 @@ function updateUI(job) {
     if (job.completed > 0) {
         document.getElementById('statsBar').classList.add('active');
         document.getElementById('statTotal').textContent = job.total;
-        const done = job.files.filter(f => f.status === 'done').length;
-        const errors = job.files.filter(f => f.status === 'error').length;
         const retryButton = document.getElementById('retryErrorsBtn');
         retryButton.style.display = errors > 0 && job.status === 'done' ? 'inline-flex' : 'none';
         const totalTime = job.files.reduce((s, f) => s + (f.time || 0), 0);
@@ -2034,6 +2992,16 @@ function updateUI(job) {
         document.getElementById('statErrors').textContent = errors;
         document.getElementById('statTime').textContent = totalTime.toFixed(1) + 's';
     }
+}
+
+function formatDuration(totalSeconds) {
+    const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+    if (seconds < 60) return seconds + 's';
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    if (minutes < 60) return `${minutes} min ${remainder}s`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours} h ${minutes % 60} min`;
 }
 
 // ── Download All ──
@@ -2045,6 +3013,7 @@ async function retryErrors() {
         const response = await fetch(`/retry-errors/${currentJobId}`, { method: 'POST' });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'No fue posible reintentar');
+        conversionInProgress = true;
         document.getElementById('resultsActions').classList.remove('active');
         document.getElementById('convertBtn').innerHTML = '⏳ Convirtiendo...';
         pollInterval = setInterval(pollStatus, 2500);
@@ -2107,12 +3076,9 @@ function toggleOptions() {
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    for resumable_job_id in load_job_snapshots():
-        threading.Thread(
-            target=run_batch_conversion,
-            args=(resumable_job_id,),
-            daemon=True,
-        ).start()
+    from waitress import serve
+
+    initialize_application()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     print(f"""
 +----------------------------------------------------+
@@ -2121,7 +3087,7 @@ if __name__ == "__main__":
 |   Ctrl+C para detener                            |
 +----------------------------------------------------+
     """)
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    serve(app, host="127.0.0.1", port=port, threads=6)
 
 
 

@@ -1,13 +1,23 @@
-PDF2MD - instrucciones para compartir
+PDF2MD 1.0.3 - ENTREGA PARA ESTUDIANTES
+========================================
 
-1. Descarga el repositorio con Code > Download ZIP.
-2. Descomprime la carpeta completa.
-3. Ejecuta iniciar_app.bat con doble clic.
-4. Espera a que instale Python y las dependencias en la primera ejecución.
-5. Usa la aplicación en http://localhost:5000
+Comparte únicamente este archivo:
 
-La aplicación permite:
-- PDF y Word a Markdown estándar.
+    release\Instalar_PDF2MD_1.0.3.exe
 
-No cierres la ventana de comandos mientras uses la aplicación. Para detenerla, presiona Ctrl+C.
-Todo el procesamiento se realiza localmente; los documentos no se suben a internet.
+El estudiante debe descargarlo, abrirlo y seguir el instalador. La aplicación
+incluye Python, el motor OCR Tesseract, español/inglés y todas sus librerías.
+No necesita instalar dependencias ni ejecutar comandos.
+
+Después de la instalación:
+
+1. PDF2MD se abre automáticamente en el navegador.
+2. También queda un acceso directo en el escritorio y en el menú Inicio.
+3. Los documentos se procesan localmente y no se envían a internet.
+
+La primera versión piloto no está firmada. Windows puede mostrar SmartScreen;
+la guía release\Guia_rapida_PDF2MD.pdf explica cómo verificar y continuar.
+
+Antes de publicar, compara la suma SHA-256 con:
+
+    release\Instalar_PDF2MD_1.0.3.sha256.txt
