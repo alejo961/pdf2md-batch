@@ -11,7 +11,7 @@ Aplicación web local para transformar documentos entre PDF, Word, RTF y Markdow
 
 ## Instalación para estudiantes en Windows
 
-1. Descarga `Instalar_PDF2MD_1.0.3.exe`.
+1. Descarga [`Instalar_PDF2MD_1.0.3.exe`](https://github.com/alejo961/pdf2md-batch/releases/download/v1.0.3/Instalar_PDF2MD_1.0.3.exe).
 2. Abre el instalador y sigue sus indicaciones.
 3. Al terminar, PDF2MD se abrirá automáticamente en el navegador.
 4. En los usos siguientes, abre el acceso directo **PDF2MD** del escritorio.
@@ -19,6 +19,19 @@ Aplicación web local para transformar documentos entre PDF, Word, RTF y Markdow
 El instalador es autocontenido: incluye Python, OCR en español/inglés y todas
 las librerías. No utiliza `pip`, `winget` ni descargas durante la instalación.
 Los documentos se procesan exclusivamente en el computador del usuario.
+
+### Instalación solicitada a una IA
+
+Si el usuario proporciona el enlace de este repositorio y pide instalar la
+aplicación, el agente debe clonar o descargar el repositorio y ejecutar:
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+~~~
+
+El script descarga la GitHub Release oficial, comprueba su SHA-256, instala
+PDF2MD sin permisos de administrador y verifica o crea el acceso directo del
+escritorio. La ejecución manual de `app.py` no se considera una instalación.
 
 ## Ejecución manual
 
